@@ -205,9 +205,9 @@ local function build_view(session_groups: { SessionGroup }, total_agents: number
         summary_text = summary_text .. string.format(" • %d waiting input!", waiting_count)
     end
 
-    table.insert(rows, tern.ui.row({
-        tern.ui.span("Agent Radar", "bold"),
-        tern.ui.span(" " .. summary_text, waiting_count > 0 and "bad" or "dim"),
+    table.insert(rows, tern.ui.text({
+        tern.ui.span("Agent Radar ", "bold"),
+        tern.ui.span(summary_text, waiting_count > 0 and "bad" or "dim"),
     }))
     table.insert(rows, tern.ui.rule({}))
 
@@ -239,17 +239,17 @@ local function build_view(session_groups: { SessionGroup }, total_agents: number
                 -- Line 1: Harness + Status Badge
                 table.insert(card_children, tern.ui.row({
                     tern.ui.badge(string.format("%s %s", a.status_icon, a.status), a.status_tone),
-                    tern.ui.span(" " .. a.harness, "accent"),
+                    tern.ui.text({ tern.ui.span(" " .. a.harness, "accent") }),
                 }))
 
                 -- Line 2: Title (Project / CWD / Command)
-                table.insert(card_children, tern.ui.row({
+                table.insert(card_children, tern.ui.text({
                     tern.ui.span("📌 " .. a.title, "bold"),
                 }))
 
                 -- Line 3: Delivery error if present
                 if a.delivery_error and a.delivery_error ~= "" then
-                    table.insert(card_children, tern.ui.row({
+                    table.insert(card_children, tern.ui.text({
                         tern.ui.span("⚠️ " .. a.delivery_error, "bad"),
                     }))
                 end
@@ -260,7 +260,7 @@ local function build_view(session_groups: { SessionGroup }, total_agents: number
                     if #snippet > 80 then
                         snippet = string.sub(snippet, 1, 77) .. "..."
                     end
-                    table.insert(card_children, tern.ui.row({
+                    table.insert(card_children, tern.ui.text({
                         tern.ui.span(snippet, "dim"),
                     }))
                 end
@@ -523,68 +523,82 @@ end)
 tern.command({
     id = "toggle",
     title = "Agent Nav: Toggle Panel",
-    keys = { "cmd+alt+n" },
+    keys = { "ctrl+alt+n" },
+    run = function(cx: WindowCx)
+        local existing = find_existing_canvas(cx)
+        if existing then
+            cx.layout:close(existing)
+            active_canvas_pane = nil
+        else
+            open_or_refresh_canvas(cx)
+        end
+    end,
 })
 
 tern.command({
     id = "set_side_left",
     title = "Agent Nav: Position Left",
+    run = function(cx: WindowCx)
+        set_side("left")
+        if active_canvas_pane then
+            local focused_pane = cx.session:focused()
+            if focused_pane and focused_pane ~= active_canvas_pane then
+                cx.layout:move(active_canvas_pane, focused_pane, "left", { focus = false })
+            end
+            update_canvas(active_canvas_pane, cx)
+        end
+        cx:toast("info", "Agent Nav: Position set to left")
+    end,
 })
 
 tern.command({
     id = "set_side_right",
     title = "Agent Nav: Position Right",
+    run = function(cx: WindowCx)
+        set_side("right")
+        if active_canvas_pane then
+            local focused_pane = cx.session:focused()
+            if focused_pane and focused_pane ~= active_canvas_pane then
+                cx.layout:move(active_canvas_pane, focused_pane, "right", { focus = false })
+            end
+            update_canvas(active_canvas_pane, cx)
+        end
+        cx:toast("info", "Agent Nav: Position set to right")
+    end,
 })
 
 tern.command({
     id = "quick_jump",
     title = "Agent Nav: Quick Jump (Picker)",
-    keys = { "cmd+shift+a" },
+    keys = { "ctrl+cmd+a" },
+    run = function(cx: WindowCx)
+        local groups = collect_session_groups(cx)
+        local items = {}
+
+        for _, s in groups do
+            for _, a in s.agents do
+                table.insert(items, {
+                    label = string.format("[%s] %s  %s", s.name, a.status_icon, a.title),
+                    detail = string.format("%s • %s", a.harness, a.status),
+                    pane = a.pane,
+                    session = s.id,
+                })
+            end
+        end
+
+        if #items == 0 then
+            cx:toast("info", "No active agents found")
+            return
+        end
+
+        cx:pick({
+            items = items,
+            placeholder = "Jump to Agent...",
+        }):next(function(chosen, err, cx)
+            if chosen and cx then
+                cx.sessions:switch(chosen.session)
+                cx.layout:focus(chosen.pane)
+            end
+        end)
+    end,
 })
-
--- Handle commands via shortcut / action binding
-tern.bind("cmd+alt+n", function(cx: WindowCx)
-    local existing = find_existing_canvas(cx)
-    if existing then
-        cx.layout:close(existing)
-        active_canvas_pane = nil
-    else
-        open_or_refresh_canvas(cx)
-    end
-end)
-
-tern.bind("cmd+shift+a", function(cx: WindowCx)
-    local groups = collect_session_groups(cx)
-    local items = {}
-
-    for _, s in groups do
-        for _, a in s.agents do
-            table.insert(items, {
-                label = string.format("[%s] %s  %s", s.name, a.status_icon, a.title),
-                detail = string.format("%s • %s", a.harness, a.status),
-                pane = a.pane,
-                session = s.id,
-            })
-        end
-    end
-
-    if #items == 0 then
-        cx:toast("info", "No active agents found")
-        return
-    end
-
-    cx:pick({
-        items = items,
-        placeholder = "Jump to Agent...",
-    }):next(function(chosen, err, cx)
-        if chosen and cx then
-            cx.sessions:switch(chosen.session)
-            cx.layout:focus(chosen.pane)
-        end
-    end)
-end)
-
--- Dynamic tab title notification: append [?] to tab if it holds an agent waiting for input
-tern.chrome.tab_title(function(tab: TabInfo): string?
-    return nil
-end)
