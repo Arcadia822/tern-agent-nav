@@ -2,6 +2,8 @@
 
 A compact navigator panel for [Tern](https://stencil.so/tern) showing agents grouped by **Tern Session → Agent Session**. Each agent is represented by a single row featuring its harness logo and session title, clickable to focus.
 
+![Agent Navigations panel](docs/screenshot.png)
+
 ## Usage
 
 - **Ctrl+Alt+N** or command palette `Agent Nav: Toggle`: Open or close the navigator panel.
