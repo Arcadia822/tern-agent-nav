@@ -1,32 +1,28 @@
-# Tern Agent-Navigations 插件
+# Tern Agent Navigations
 
-Tern 的 Agent 跨 Session 导航器插件（类似 Herdr），提供全局 Agent 状态雷达面板与秒级定位跳转。
+A compact navigator panel for [Tern](https://stencil.so/tern) showing agents grouped by **Tern Session → Agent Session**. Each agent is represented by a single row featuring its harness logo and session title, clickable to focus.
 
-## 功能特性
+## Usage
 
-1. **按 Session 分组展示**：
-   - 自动聚合全局跨 Session 的所有 Agent Blocks。
-   - 每个 Session 独立分栏（标明当前 Session、Agent 数量）。
-2. **完整字段透视**：
-   - **Harness**：智能识别 Agent 类型（`omp`、`acp`、`carly`、`claude`、`codex` 等）并附带模型版本（如 `omp • sonnet-3.7`）。
-   - **Title**：读取 Pane Title，未命名时回退至 CWD 目录名称。
-   - **Session Status**：
-     - 🟡 `Working`：正在运行生成/工具调用
-     - ❓ `Waiting Input`：等待用户人工确认/输入（高亮提示）
-     - 🟢 `Idle`：已完成当前轮次，空闲
-     - ⚪ `Exited`：进程已退出
-     - ⚠️ `Error`：投递异常提示
-   - **Last Message**：实时预览最近一条助手输出摘要。
-3. **精准跳转**：
-   - 点击卡片上的「Focus Agent →」按钮，自动切换至目标 Session 并聚焦到该 Block。
-4. **灵活布局配置**：
-   - **固定方向**：支持固定在 `left`（左侧）或 `right`（右侧，默认）。
-   - **默认宽度**：约 240px（~28 终端字符列宽），保持侧边栏紧凑不挤占主编辑区。
-5. **开启策略配置**：
-   - `on_agent`（默认）：当前 Session 存在 Agent Block 时自动弹出常驻。
-   - `always`：所有 Session 始终常驻开启。
-   - `manual`：仅在用户按快捷键或呼出命令时开启。
-   - 面板底部提供 Dock 按钮即时切换位置与开启模式（自动保存至 `tern.kv`）。
-6. **全局快捷键**：
-   - `Cmd+Alt+N`：快速展开/折叠 Agent-Nav 面板。
-   - `Cmd+Shift+A`：呼出原生 Quick Jump Picker，支持全局键盘过滤并秒级切 Agent。
+- **Ctrl+Alt+N** or command palette `Agent Nav: Toggle`: Open or close the navigator panel.
+- Command palette `Agent Nav: Toggle left / right`: Toggle panel attachment between the left and right window edge.
+- Command palette `Agent Nav: Reset Width`: Reset panel width to the default ratio (20% of the active tab width).
+- Click any agent row: Immediately switches to that agent's Tern session and focuses its pane.
+
+## Behavior & Design
+
+- **Single panel per window, follows active tab**: Following the architecture of Overseer's Projects panel, the window keeps exactly one canvas instance. When switching tabs or sessions, the panel moves into the active tab as a full-height rail on the designated edge. The target tab's existing split hierarchy and ratios are cleanly preserved.
+- **Proportional fixed width**: Dragging the divider updates the remembered share ratio (`agent_nav.share`), which travels across tabs and scales smoothly with window resizing.
+- **Titles and harness**: each row shows the agent's pane title (omp, Codex and Copilot write their session title there). The harness logo comes from the pane's foreground program, so Codex and Copilot are recognised even when their title does not name them.
+- **Row states** (all colors are Tern theme variables, so they follow light/dark mode and the chosen color theme): running — warning color with Tern's native text shimmer; waiting for input — purple; finished and unread — green; error — red; read — secondary text. Tern session names are shown as written, fainter than agent titles.
+- **State sources and precedence**: authoritative agent-block state (omp and wrapped chat agents) is trusted when it reports working or waiting_input; an idle/exited report is cross-checked before it is believed — against the pane title's spinner frames (leading or trailing braille), the busy/prompt pair, and the pane's last eight visible screen rows. A stale report (ACP-wrapped panes have reported idle through a real turn) therefore cannot mask real activity. Matching uses the observed English UI text of Copilot, Codex and Claude Code; when those agents change their interfaces the hint tables in `window.luau` need updating.
+- **Hook budget**: screen reads are cached per pane and staggered (at most two fresh reads per render, refreshed on cheap-signal change or after a few ticks), and the split-ratio restoration after a tab switch is spread across ticks. A full steering loop inside one hook exceeded Tern's 50 ms plugin budget, after which Tern disables the hook until reload and the panel freezes on stale state.
+- **Safe lifecycle**: Explicitly closing the panel disables the feature; if the containing tab or session is closed, the panel automatically restores in the remaining active tab.
+- Persisted configuration keys: `agent_nav.enabled`, `agent_nav.side`, `agent_nav.share`.
+
+## Installation
+
+```sh
+tern plugin install /path/to/tern-agent-nav --force
+tern plugin reload
+```
