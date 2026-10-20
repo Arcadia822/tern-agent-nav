@@ -447,6 +447,8 @@ end
 local ASK_HINTS = {
 	"enter accept · tab next · ctrl+d decline", -- GitHub Copilot ask_user
 	"enter continue · esc skip", -- Codex update/confirm picker
+	"esc to cancel · tab to amend", -- Claude Code tool permission / confirmation
+	"do you want to proceed?", -- Claude Code confirmation
 }
 local WORKING_HINTS = {
 	-- GitHub Copilot status line while a turn runs: "◉ Working esc esc edit prompt"
