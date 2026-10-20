@@ -20,9 +20,24 @@ A compact navigator panel for [Tern](https://stencil.so/tern) showing agents gro
 - **Safe lifecycle**: Explicitly closing the panel disables the feature; if the containing tab or session is closed, the panel automatically restores in the remaining active tab.
 - Persisted configuration keys: `agent_nav.enabled`, `agent_nav.side`, `agent_nav.share`.
 
+## Known Limitations
+
+- **Upstream pane-id truncation** ([stencil-hq/tern-sdk#30](https://github.com/stencil-hq/tern-sdk/issues/30)): on a long-lived daemon that has created many tabs, new tab ids exceed the window API's 44-bit range, so the panel cannot move into those tabs and shows an explicit error instead. Status display keeps working; only move/resize of the affected tab is disabled.
+- **Screen-hint matching**: status detection for terminal agents matches the observed English UI text of Copilot, Codex and Claude Code (see the hint tables in `window.luau`). A localized or reworded agent interface can hide a running or waiting state until the hints are updated.
+- A Copilot pane whose monthly quota is exhausted shows as a plain finished row; it is not misreported as running.
+
+## Development
+
+- `tests/smoke.py` — blackbox end-to-end regression against a running Tern window.
+- `.agents/skills/verify-tern-agent-nav/` — live verification harness (launch/doctor/drive/evidence) with the feature map under `features/`.
+
 ## Installation
 
 ```sh
 tern plugin install /path/to/tern-agent-nav --force
 tern plugin reload
 ```
+
+## License
+
+[MIT](LICENSE)
