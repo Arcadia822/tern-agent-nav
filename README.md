@@ -24,7 +24,7 @@ A compact navigator panel for [Tern](https://stencil.so/tern) showing agents gro
 
 ## Known Limitations
 
-- **Upstream pane-id truncation** ([stencil-hq/tern-sdk#30](https://github.com/stencil-hq/tern-sdk/issues/30)): on a long-lived daemon that has created many tabs, new tab ids exceed the window API's 44-bit range, so the panel cannot move into those tabs and shows an explicit error instead. Status display keeps working; only move/resize of the affected tab is disabled.
+- **Older Tern builds** ([stencil-hq/tern-sdk#30](https://github.com/stencil-hq/tern-sdk/issues/30)): before the fix in Tern 0.9.7, every `tern` CLI attach spent a step of the daemon-wide id counter, so a daemon that had served thousands of them handed window plugins truncated tab ids. On such a build the panel cannot move into the newer tabs and shows an explicit error instead; status display keeps working. Tern 0.9.7 no longer advances the counter on read-only CLI attaches.
 - **Screen-hint matching**: status detection for terminal agents matches the observed English UI text of Copilot, Codex and Claude Code (see the hint tables in `window.luau`). A localized or reworded agent interface can hide a running or waiting state until the hints are updated.
 - A Copilot pane whose monthly quota is exhausted shows as a plain finished row; it is not misreported as running.
 
@@ -34,6 +34,8 @@ A compact navigator panel for [Tern](https://stencil.so/tern) showing agents gro
 - `.agents/skills/verify-tern-agent-nav/` — live verification harness (launch/doctor/drive/evidence) with the feature map under `features/`.
 
 ## Installation
+
+Requires Tern 0.9.7 or newer.
 
 ```sh
 tern plugin install /path/to/tern-agent-nav --force

@@ -386,7 +386,7 @@ local function settle(cx: WindowCx)
 -- A pane's foreground program, from `tern process`, for terminal panes whose
 -- window metadata no longer carries the command (programs started before this
 -- window opened). One lookup per pane and title: every CLI call is a daemon
--- connection, and those advance the id counter of stencil-hq/tern-sdk#30.
+-- connection, so they are cached rather than repeated on each render.
 local foreground: { [number]: { title: string, argv: string } } = {}
 local probing: { [number]: boolean } = {}
 
