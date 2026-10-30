@@ -9,10 +9,10 @@ drives; line numbers cited are from that working tree.
 |---|---|---|
 | 01 | [nav-rows-session-titles.md](01-nav-rows-session-titles.md) | omp/codex/copilot session title 更新进导航行 |
 | 02 | [running-shimmer.md](02-running-shimmer.md) | running 只让文字 shimmer（光影在文字上，非背景/字形位移动画） |
-| 03 | [status-colors-theme.md](03-status-colors-theme.md) | 状态颜色 running 黄、完成未读绿、完成已读默认、等待人类紫、错误红，全部随 Tern 主题明暗迁移 |
+| 03 | [status-colors-theme.md](03-status-colors-theme.md) | 黄/绿/红保持语义色；浅色 running 亮黄底深色字；错误红加粗；明暗模式均可辨识 |
 | 04 | [harness-logo.md](04-harness-logo.md) | harness logo 尺寸/裁切/对齐/明暗切换 |
 | 05 | [session-name-style.md](05-session-name-style.md) | Tern session 名非全大写且比 agent 标题更淡 |
-| 06 | [toggle-preset-width.md](06-toggle-preset-width.md) | toggle 打开时使用预设/记忆宽度，Reset Width 回默认 |
+| 06 | [toggle-preset-width.md](06-toggle-preset-width.md) | 打开使用记忆宽度；多 block 跨 tick 重建不污染 share；拖拽与 Reset Width 正常 |
 | 07 | [copilot-ask-user.md](07-copilot-ask-user.md) | copilot ask-user 识别为等待人类（紫色），且优先于 running |
 | 08 | [notifications-english.md](08-notifications-english.md) | 插件通知文案全英文 |
 

@@ -14,9 +14,9 @@ A compact navigator panel for [Tern](https://stencil.so/tern) showing agents gro
 ## Behavior & Design
 
 - **Single panel per window, follows active tab**: Following the architecture of Overseer's Projects panel, the window keeps exactly one canvas instance. When switching tabs or sessions, the panel moves into the active tab as a full-height rail on the designated edge. The target tab's existing split hierarchy and ratios are cleanly preserved.
-- **Proportional fixed width**: Dragging the divider updates the remembered share ratio (`agent_nav.share`), which travels across tabs and scales smoothly with window resizing.
+- **Proportional fixed width**: Dragging the divider updates the remembered share ratio (`agent_nav.share`), which travels across tabs and scales smoothly with window resizing. Intermediate widths produced while rebuilding a multi-block tab are never saved as manual divider adjustments.
 - **Titles and harness**: each row shows the agent's pane title (omp, Codex and Copilot write their session title there). The harness logo comes from the pane's foreground program, so Codex and Copilot are recognised even when their title does not name them.
-- **Row states** (all colors are Tern theme variables, so they follow light/dark mode and the chosen color theme): running — warning color with Tern's native text shimmer; waiting for input — purple; finished and unread — green; error — red; read — secondary text. Tern session names are shown as written, fainter than agent titles.
+- **Row states**: running — amber text shimmer, with dark text on a bright yellow background in light mode; finished and unread — green; error — semibold red. These semantic hues stay consistent across color themes, with separate light/dark values for readability. Waiting for input uses the theme's purple, and read rows use secondary text. Tern session names are shown as written, fainter than agent titles.
 - **State sources and precedence**: authoritative agent-block state (omp and wrapped chat agents) is trusted when it reports working or waiting_input; an idle/exited report is cross-checked before it is believed — against the pane title's spinner frames (leading or trailing braille), the busy/prompt pair, and the pane's last eight visible screen rows. A stale report (ACP-wrapped panes have reported idle through a real turn) therefore cannot mask real activity. Matching uses the observed English UI text of Copilot, Codex and Claude Code; when those agents change their interfaces the hint tables in `window.luau` need updating.
 - **Hook budget**: screen reads are cached per pane and staggered (at most two fresh reads per render, refreshed on cheap-signal change or after a few ticks), and the split-ratio restoration after a tab switch is spread across ticks. A full steering loop inside one hook exceeded Tern's 50 ms plugin budget, after which Tern disables the hook until reload and the panel freezes on stale state.
 - **Safe lifecycle**: Explicitly closing the panel disables the feature; if the containing tab or session is closed, the panel automatically restores in the remaining active tab.
@@ -31,6 +31,7 @@ A compact navigator panel for [Tern](https://stencil.so/tern) showing agents gro
 ## Development
 
 - `tests/smoke.py` — blackbox end-to-end regression against a running Tern window.
+- `tests/width_regression.py` — focused native regression for four-block tab switches and width memory. Run against an isolated GUI sandbox with `python3 tests/width_regression.py --control /tmp/navw.sock --config /tmp/navw/config --daemon /tmp/navw/daemon.sock` after installing the plugin there. It checks both rail sides, content ratios, unchanged default width memory and manual divider adjustments without invoking a model.
 - `.agents/skills/verify-tern-agent-nav/` — live verification harness (launch/doctor/drive/evidence) with the feature map under `features/`.
 
 ## Installation
