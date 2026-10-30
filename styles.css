@@ -4,6 +4,7 @@
     position: relative;
     display: flex;
     flex-direction: column;
+    flex: 1;
     width: 100%;
     height: 100%;
     min-width: 0;
@@ -26,14 +27,15 @@
 }
 .agent-nav-heading { font-size: 13px; font-weight: 550; }
 .agent-nav-groups { display: flex; flex-direction: column; gap: 16px; padding: 8px 0 12px; }
-.agent-nav-group { display: flex; flex-direction: column; min-width: 0; }
+.agent-nav-group { position: relative; display: flex; flex-direction: column; min-width: 0; }
 
 /* Tern session name: as written, fainter than any agent title. */
 .agent-nav-session {
     padding: 4px 12px;
     font-size: 12px;
     font-weight: 500;
-    color: var(--t4);
+    color: var(--t2);
+    opacity: 0.6;
     overflow: hidden;
     white-space: nowrap;
     text-overflow: ellipsis;
@@ -110,3 +112,134 @@
 }
 
 .agent-nav-empty { padding: 8px 12px; color: var(--t3); }
+
+/* Session header: the name, then the harness menu and `+` actions. */
+.agent-nav-session-row {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    padding-right: 6px;
+    min-width: 0;
+}
+.agent-nav-session-row .agent-nav-session { flex: 1 1 auto; min-width: 0; }
+
+.agent-nav-action {
+    display: grid;
+    place-items: center;
+    flex: none;
+    width: 18px;
+    height: 18px;
+    padding: 0;
+    border: 0;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--t3);
+    cursor: pointer;
+}
+.agent-nav-action:hover,
+.agent-nav-action:focus-visible { background: var(--l1); color: var(--t1); }
+.agent-nav-action:focus-visible { outline: 1px solid var(--l4); outline-offset: -1px; }
+/* Tern's glyphs draw at 14px; shrink them to fit the 18px button. */
+.agent-nav-action .sf-icon { width: 13px; height: 13px; }
+
+/* Floating under the session header: absolutely positioned, so opening it never
+   pushes the rows it covers out of place. */
+.agent-nav-menu {
+    position: absolute;
+    top: 26px;
+    right: 6px;
+    width: max-content;
+    min-width: min(160px, calc(100% - 14px));
+    max-width: min(240px, calc(100% - 14px));
+    z-index: 5;
+    display: flex;
+    flex-direction: column;
+    max-height: 60vh;
+    overflow-y: auto;
+    padding: 2px;
+    border: 1px solid var(--border);
+    border-radius: var(--r-ctl, 8px);
+    background: light-dark(#fff, #232327);
+    color: var(--t1);
+}
+.agent-nav-menu-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 3px 8px;
+    border: 0;
+    border-radius: 4px;
+    background: transparent;
+    text-align: left;
+    font: inherit;
+    color: var(--t2);
+    cursor: pointer;
+}
+.agent-nav-menu-item:hover,
+.agent-nav-menu-item:focus-visible { background: var(--l2); color: var(--t1); }
+.agent-nav-menu-name {
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+}
+.agent-nav-avatar {
+    display: grid;
+    place-items: center;
+    flex: none;
+    width: 14px;
+    height: 14px;
+    border-radius: 999px;
+    background: var(--l2);
+    color: var(--t1);
+    font-size: 9px;
+    font-weight: 600;
+}
+
+.agent-nav-mode {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    margin: 2px 2px 4px;
+    padding: 6px;
+    border-bottom: 1px solid var(--l3);
+    color: var(--t1);
+    font-size: 12px;
+    white-space: nowrap;
+}
+.agent-nav-mode .agent-nav-mode-switch {
+    display: flex;
+    align-items: center;
+    flex: none;
+    width: 30px;
+    height: 18px;
+    padding: 2px;
+    border: 0;
+    border-radius: 999px;
+    background: var(--l3);
+    box-shadow: none;
+    cursor: pointer;
+}
+.agent-nav-mode .agent-nav-mode-switch.is-on { background: var(--accent); }
+.agent-nav-switch-thumb {
+    display: block;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: #fff;
+    pointer-events: none;
+}
+.agent-nav-mode-switch.is-on .agent-nav-switch-thumb { margin-left: auto; }
+.agent-nav-mode-switch:focus-visible { outline: 1px solid var(--t1); outline-offset: 2px; }
+.agent-nav-menu-item.is-disabled { opacity: 0.45; cursor: default; }
+.agent-nav-menu-item.is-disabled:hover { background: transparent; color: var(--t2); }
+
+.agent-nav-dismiss {
+    position: fixed;
+    inset: 0;
+    z-index: 4;
+    border: 0;
+    padding: 0;
+    background: transparent;
+}

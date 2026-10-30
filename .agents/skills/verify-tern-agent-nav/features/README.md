@@ -15,6 +15,7 @@ drives; line numbers cited are from that working tree.
 | 06 | [toggle-preset-width.md](06-toggle-preset-width.md) | toggle 打开时使用预设/记忆宽度，Reset Width 回默认 |
 | 07 | [copilot-ask-user.md](07-copilot-ask-user.md) | copilot ask-user 识别为等待人类（紫色），且优先于 running |
 | 08 | [notifications-english.md](08-notifications-english.md) | 插件通知文案全英文 |
+| 09 | [session-harness-actions.md](09-session-harness-actions.md) | + / … 按钮、紧凑全局 dropdown、不透明背景、关闭交互、UI 模式、Harness 图标与字母 Avatar |
 
 ## Harness
 

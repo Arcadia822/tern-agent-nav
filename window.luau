@@ -21,6 +21,7 @@ local CELLS_GUESS = 180
 local KV_ENABLED = "agent_nav.enabled"
 local KV_SIDE = "agent_nav.side"
 local KV_SHARE = "agent_nav.share"
+local KV_LAUNCH_UI = "agent_nav.launch_ui"
 
 -- Clean up settings from obsolete layouts.
 for _, key in { "agent_nav.width", "agent_nav.auto_tabs", "agent_nav.omp_debug", "agent_nav.panes_dump", "agent_nav.test_ping" } do
@@ -48,6 +49,13 @@ local HARNESS_ICONS: { [string]: string } = {
 	carly = "sparkle",
 }
 
+-- Tern registers these ids before their ACP adapters are installed.
+local BUILTIN_AGENTS: { { id: string, label: string } } = {
+	{ id = "claude", label = "Claude Code" },
+	{ id = "codex", label = "Codex" },
+	{ id = "copilot", label = "GitHub Copilot" },
+}
+
 type Side = "left" | "right"
 
 type AgentRow = {
@@ -58,6 +66,12 @@ type AgentRow = {
 	status: string,
 	is_current: boolean,
 }
+
+type Badge = { kind: "icon", name: string } | { kind: "letter", text: string }
+type LaunchUI = "tui" | "chat"
+type Harness = { id: string, label: string, badge: Badge, tui: string?, chat: string }
+type Menu = { session: number, items: { Harness } }
+type Action = { pattern: string, run: (cx: WindowCx, session: number, arg: string?) -> boolean }
 
 --------------------------------------------------------------------------------
 -- Settings & State
@@ -230,6 +244,10 @@ local SCREEN_TTL_TICKS = 8
 local SCREEN_READS_PER_TICK = 2
 local tickCounter = 0
 local screenBudget = 0
+
+-- The open harness menu; its items are built when it opens, so rendering never
+-- reads settings or the filesystem.
+local menu: Menu? = nil
 
 local function slot(cx: WindowCx): number?
 	if slotPane and not cx.session:pane(slotPane) then
@@ -508,6 +526,294 @@ local function screenStateCached(cx: WindowCx, p: any): ("ask" | "working")?
 	return state
 end
 
+--------------------------------------------------------------------------------
+-- Harness actions
+--------------------------------------------------------------------------------
+
+-- Harness keys in a fixed order: table iteration order is not, and a menu entry
+-- must match exactly like the row it mirrors.
+local HARNESS_KEYS: { string } = {}
+for key in HARNESS_ICONS do
+	table.insert(HARNESS_KEYS, key)
+end
+table.sort(HARNESS_KEYS)
+
+local function harness_icon(text: string): (string?, string?)
+	local lower = string.lower(text)
+	if lower == "" then
+		return nil, nil
+	end
+	for _, key in HARNESS_KEYS do
+		if string.find(lower, key, 1, true) then
+			return key, HARNESS_ICONS[key]
+		end
+	end
+	return nil, nil
+end
+
+local function letter_of(name: string): string
+	local ok, letter = pcall(function()
+		local i = 1
+		while i <= #name do
+			local cp = utf8.codepoint(name, i)
+			if cp > 0x20 then
+				return string.upper(utf8.char(cp))
+			end
+			i = utf8.offset(name, 2, i) or (#name + 1)
+		end
+		return "?"
+	end)
+	return if ok and letter then letter else "?"
+end
+
+local function shell_quote(text: string): string
+	return "'" .. string.gsub(text, "'", "'\\''") .. "'"
+end
+
+local function badge_of(id: string, label: string): Badge
+	for _, source in { id, label } do
+		local _, icon = harness_icon(source)
+		if icon then
+			return { kind = "icon", name = icon }
+		end
+	end
+	return { kind = "letter", text = letter_of(label) }
+end
+
+local function launch_ui(): LaunchUI
+	return if tern.kv.get(KV_LAUNCH_UI) == "tui" then "tui" else "chat"
+end
+
+local function harness_of(id: string, label: string, tui: string?): Harness
+	return { id = id, label = label, badge = badge_of(id, label), tui = tui, chat = "command tern acp " .. shell_quote(id) }
+end
+
+local function default_harness(): Harness
+	return {
+		id = "omp-default", label = "OMP", badge = { kind = "icon", name = "app-omp" },
+		tui = "env PI_TUI_NATIVE=0 omp", chat = "env PI_TUI_NATIVE=1 omp",
+	}
+end
+
+-- Every harness Tern perceives locally, in menu order: its registered built-ins,
+-- then the configured custom agents. Read when a menu opens, never per row.
+local function build_harnesses(cx: WindowCx): { Harness }
+	local items: { Harness } = { default_harness() }
+	for _, agent in BUILTIN_AGENTS do
+		table.insert(items, harness_of(agent.id, agent.label, "command " .. agent.id))
+	end
+	local customs = cx.settings:get("agents.custom")
+	if type(customs) == "table" then
+		for _, agent in customs do
+			if type(agent) == "table" and type(agent.id) == "string" and type(agent.command) == "string" then
+				local label = if type(agent.name) == "string" and agent.name ~= "" then agent.name else agent.id
+				table.insert(items, harness_of(agent.id, label, nil))
+			end
+		end
+	end
+	return items
+end
+
+-- New blocks start where the session's first tab runs. nil (or an unknown or
+-- blank directory) lets Tern pick.
+local function session_cwd(cx: WindowCx, session: number): string?
+	local first: number? = nil
+	for _, info in cx.session:sessions() do
+		if info.id == session then
+			first = info.tabs[1]
+			break
+		end
+	end
+	if not first then
+		return nil
+	end
+	for _, tab in cx.session:tabs() do
+		if tab.id == first then
+			return if tab.cwd and tab.cwd ~= "" then tab.cwd else nil
+		end
+	end
+	return nil
+end
+
+local function open_harness(cx: WindowCx, session: number, h: Harness): boolean
+	local command = if launch_ui() == "tui" then h.tui else h.chat
+	if not command then
+		return false
+	end
+	local cwd = session_cwd(cx, session)
+	cx.sessions:switch(session)
+	menu = nil
+	local pane = cx.layout:new_tab({ command = command, cwd = cwd }, { focus = true })
+	if not pane then
+		cx:toast("error", "Agent Nav: Could not open " .. h.label, "")
+	end
+	return true
+end
+
+local function toggle_menu(cx: WindowCx, session: number): boolean
+	if menu and menu.session == session then
+		menu = nil
+	else
+		menu = { session = session, items = build_harnesses(cx) }
+	end
+	return true
+end
+
+local function goto_key(session: number, pane: number): string
+	return "goto:" .. tostring(session) .. ":" .. tostring(pane)
+end
+
+local function new_key(session: number): string
+	return "new:" .. tostring(session)
+end
+
+local function menu_key(session: number): string
+	return "menu:" .. tostring(session)
+end
+
+local function pick_key(session: number, harness_id: string): string
+	return "pick:" .. tostring(session) .. ":" .. harness_id
+end
+
+local ACTIONS: { [string]: Action } = {
+	goto = {
+		pattern = "^(%d+):(%d+)$",
+		run = function(cx, session, arg)
+			local pane = tonumber(arg)
+			if not pane then
+				return false
+			end
+			menu = nil
+			cx.sessions:switch(session)
+			cx.layout:focus(pane)
+			return true
+		end,
+	},
+	new = {
+		pattern = "^(%d+)$",
+		run = function(cx, session)
+			return open_harness(cx, session, default_harness())
+		end,
+	},
+	menu = {
+		pattern = "^(%d+)$",
+		run = function(cx, session)
+			return toggle_menu(cx, session)
+		end,
+	},
+	dismiss = {
+		pattern = "^(%d+)$",
+		run = function()
+			menu = nil
+			return true
+		end,
+	},
+	mode = {
+		pattern = "^(%d+):(%a+)$",
+		run = function(_cx, session, value)
+			if not menu or menu.session ~= session or (value ~= "tui" and value ~= "chat") then
+				return false
+			end
+			tern.kv.set(KV_LAUNCH_UI, value)
+			return true
+		end,
+	},
+	-- A click can only launch what the menu showed, so `pick` resolves against
+	-- the open menu: a key from an earlier menu does nothing.
+	pick = {
+		pattern = "^(%d+):(.+)$",
+		run = function(cx, session, arg)
+			local open = menu
+			if not arg or not open or open.session ~= session then
+				return false
+			end
+			for _, h in open.items do
+				if h.id == arg then
+					return open_harness(cx, session, h)
+				end
+			end
+			return false
+		end,
+	},
+}
+
+-- Route one canvas click; false when it is not ours, so the caller keeps its own
+-- fallback.
+local function dispatch(cx: WindowCx, act: string): boolean
+	local verb, rest = string.match(act, "^(%a+):(.*)$")
+	if not verb or not rest then
+		return false
+	end
+	local action = ACTIONS[verb]
+	if not action then
+		return false
+	end
+	local session, arg = string.match(rest, action.pattern)
+	local sid = tonumber(session)
+	if not sid then
+		return false
+	end
+	return action.run(cx, sid, arg)
+end
+
+local function badge_node(badge: Badge): Node
+	if badge.kind == "icon" then
+		return ui.el("span", { class = "agent-nav-logo", attrs = { ["aria-hidden"] = "true" } }, {
+			ui.node("icon", { name = badge.name }),
+		})
+	end
+	return ui.el("span", { class = "agent-nav-avatar", attrs = { ["aria-hidden"] = "true" }, text = badge.text })
+end
+
+local function icon_button(key: string, icon: string, title: string): Node
+	return ui.el("button", {
+		key = key,
+		actions = { click = key },
+		class = "agent-nav-action",
+		attrs = { title = title, ["aria-label"] = title },
+	}, {
+		ui.node("icon", { name = icon }),
+	})
+end
+
+local function session_header(session: number, name: string): Node
+	return ui.el("div", { class = "agent-nav-session-row" }, {
+		ui.el("div", { class = "agent-nav-session", text = name }),
+		icon_button(new_key(session), "plus", "New agent tab"),
+		icon_button(menu_key(session), "more", "Choose a harness"),
+	})
+end
+
+local function menu_node(m: Menu): Node
+	local selected = launch_ui()
+	local enabled = selected == "chat"
+	local key = "mode:" .. tostring(m.session) .. ":" .. (if enabled then "tui" else "chat")
+	local rows: { Node } = {
+		ui.el("div", { class = "agent-nav-mode" }, {
+			ui.el("span", { text = "Enable Tern UI" }),
+			ui.el("button", {
+				key = key, actions = { click = key },
+				class = "agent-nav-mode-switch" .. (if enabled then " is-on" else ""),
+				attrs = { role = "switch", ["aria-label"] = "Enable Tern UI", ["aria-checked"] = tostring(enabled) },
+			}, { ui.el("span", { class = "agent-nav-switch-thumb" }) }),
+		}),
+	}
+	for _, h in m.items do
+		local key = pick_key(m.session, h.id)
+		local unavailable = selected == "tui" and h.tui == nil
+		table.insert(rows, ui.el("button", {
+			key = key,
+			actions = if unavailable then nil else { click = key },
+			class = "agent-nav-menu-item" .. (if unavailable then " is-disabled" else ""),
+			attrs = { title = if unavailable then h.label .. " (Tern Chat UI only)" else h.label, ["aria-disabled"] = tostring(unavailable) },
+		}, {
+			badge_node(h.badge),
+			ui.el("span", { class = "agent-nav-menu-name", text = h.label }),
+		}))
+	end
+	return ui.el("div", { class = "agent-nav-menu" }, rows)
+end
+
 local function detect_harness(pane_info: any): (string, string)
 	if pane_info.kind == "carly" then
 		return "carly", "sparkle"
@@ -523,10 +829,9 @@ local function detect_harness(pane_info: any): (string, string)
 	local prog = string.lower(pane_info.program or "")
 	local title = string.lower(pane_info.title or "")
 	for _, source in { command, probed, prog, title } do
-		for key, icon in HARNESS_ICONS do
-			if source ~= "" and string.find(source, key, 1, true) then
-				return key, icon
-			end
+		local key, icon = harness_icon(source)
+		if key and icon then
+			return key, icon
 		end
 	end
 	if pane_info.kind == "agent" then
@@ -671,13 +976,18 @@ local function build_view(cx: WindowCx): Node
 		end
 	end
 
+	local menu_drawn = false
 	local sections = {}
 	for _, sid in session_order do
 		local g = session_groups[sid]
 		if #g.agents > 0 then
-			local rows = { ui.el("div", { class = "agent-nav-session", text = g.name }) }
+			local rows = { session_header(sid, g.name) }
+			if menu and menu.session == sid then
+				table.insert(rows, menu_node(menu))
+				menu_drawn = true
+			end
 			for _, ag in g.agents do
-				local action_key = "goto:" .. tostring(ag.session) .. ":" .. tostring(ag.pane)
+				local action_key = goto_key(ag.session, ag.pane)
 				table.insert(rows, ui.el("button", {
 					key = action_key,
 					actions = { click = action_key },
@@ -700,16 +1010,25 @@ local function build_view(cx: WindowCx): Node
 		end
 	end
 
+	if menu and not menu_drawn then
+		menu = nil
+	end
+
 	if #sections == 0 then
 		table.insert(sections, ui.el("div", { class = "agent-nav-empty", text = "No agent sessions active" }))
 	end
 
-	return ui.el("div", { class = "agent-nav-root" }, {
+	local children = {
 		ui.el("header", { class = "agent-nav-header" }, {
 			ui.el("span", { class = "agent-nav-heading", text = "Agents" }),
 		}),
 		ui.el("div", { class = "agent-nav-groups" }, sections),
-	})
+	}
+	if menu then
+		local key = "dismiss:" .. tostring(menu.session)
+		table.insert(children, ui.el("button", { key = key, actions = { click = key }, class = "agent-nav-dismiss", attrs = { ["aria-label"] = "Close harness menu" } }))
+	end
+	return ui.el("div", { class = "agent-nav-root" }, children)
 end
 
 local rendered: string? = nil
@@ -827,6 +1146,7 @@ tern.command({
 		if pane then
 			setWantPanel(false)
 			panelTab, slotPane, rendered, renderedPane = nil, nil, nil, nil
+			menu = nil
 			appliedShare, placedSide = nil, nil
 			pendingFits, pendingSize, pendingTab = {}, false, nil
 			cx.layout:close(pane)
@@ -874,17 +1194,17 @@ tern.on("canvas_action", function(ev: CanvasAction, cx: WindowCx): boolean?
 	if ev.pane ~= slot(cx) then
 		return false
 	end
-	local sid_str, pid_str = string.match(ev.act, "^goto:(%d+):(%d+)$")
-	local sid, pid = tonumber(sid_str), tonumber(pid_str)
-	if not sid or not pid then
-		return false
+	if dispatch(cx, ev.act) then
+		draw(cx)
+		return true
 	end
-	cx.sessions:switch(sid)
-	cx.layout:focus(pid)
-	return true
+	return false
 end)
 
 tern.on("focus", function(ev: FocusEvent, cx: WindowCx)
+	if menu and ev.pane ~= slotPane then
+		menu = nil
+	end
 	followAndDraw(cx, ev.tab)
 end)
 
