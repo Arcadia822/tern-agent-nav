@@ -162,16 +162,19 @@
     background: light-dark(#fff, #232327);
     color: var(--t1);
 }
+.agent-nav-menu-item,
+.agent-nav-mode {
+    padding: 3px 8px;
+    font: inherit;
+}
 .agent-nav-menu-item {
     display: flex;
     align-items: center;
     gap: 8px;
-    padding: 3px 8px;
     border: 0;
     border-radius: 4px;
     background: transparent;
     text-align: left;
-    font: inherit;
     color: var(--t2);
     cursor: pointer;
 }
@@ -201,13 +204,12 @@
     align-items: center;
     justify-content: space-between;
     gap: 16px;
-    margin: 2px 2px 4px;
-    padding: 6px;
+    margin: 0;
     border-bottom: 1px solid var(--l3);
     color: var(--t1);
-    font-size: 12px;
     white-space: nowrap;
 }
+.agent-nav-mode:first-child { border-bottom: 0; }
 .agent-nav-mode .agent-nav-mode-switch {
     display: flex;
     align-items: center;

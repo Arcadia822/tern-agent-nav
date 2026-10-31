@@ -22,6 +22,7 @@ local KV_ENABLED = "agent_nav.enabled"
 local KV_SIDE = "agent_nav.side"
 local KV_SHARE = "agent_nav.share"
 local KV_LAUNCH_UI = "agent_nav.launch_ui"
+local KV_OPEN_TAB = "agent_nav.open_in_tab"
 
 -- Clean up settings from obsolete layouts.
 for _, key in { "agent_nav.width", "agent_nav.auto_tabs", "agent_nav.omp_debug", "agent_nav.panes_dump", "agent_nav.test_ping" } do
@@ -584,6 +585,13 @@ local function launch_ui(): LaunchUI
 	return if tern.kv.get(KV_LAUNCH_UI) == "tui" then "tui" else "chat"
 end
 
+-- Where an open action puts the new block: its own tab, or beside the block the
+-- target session's shown tab displays. Missing means a new tab, and it is
+-- saved separately from the UI mode above.
+local function open_in_tab(): boolean
+	return tern.kv.get(KV_OPEN_TAB) ~= false
+end
+
 local function harness_of(id: string, label: string, tui: string?): Harness
 	return { id = id, label = label, badge = badge_of(id, label), tui = tui, chat = "command tern acp " .. shell_quote(id) }
 end
@@ -635,6 +643,55 @@ local function session_cwd(cx: WindowCx, session: number): string?
 	return nil
 end
 
+-- True when `pane` is a leaf of the tiled tree `t` (floats are not leaves).
+local function in_tree(t: any, pane: number): boolean
+	if not t then
+		return false
+	end
+	if t.pane then
+		return t.pane == pane
+	end
+	return in_tree(t[1], pane) or in_tree(t[2], pane)
+end
+
+-- The first tiled block of `t` that is not the navigator rail.
+local function first_content(t: any, rail: number?): number?
+	if not t then
+		return nil
+	end
+	if t.pane then
+		return if t.pane ~= rail then t.pane else nil
+	end
+	return first_content(t[1], rail) or first_content(t[2], rail)
+end
+
+-- Use content in the shown tab even when the navigator holds focus.
+local function shown_content(cx: WindowCx, session: number): number?
+	local tab = shownTab(cx)
+	if not tab then
+		return nil
+	end
+	local owner: number? = nil
+	for _, info in cx.session:tabs() do
+		if info.id == tab then
+			owner = info.session
+			break
+		end
+	end
+	if owner ~= session then
+		return nil
+	end
+	local layout = cx.session:layout(tab)
+	if not layout then
+		return nil
+	end
+	local rail = slotPane
+	if layout.focus and layout.focus ~= rail and in_tree(layout.root, layout.focus) then
+		return layout.focus
+	end
+	return first_content(layout.root, rail)
+end
+
 local function open_harness(cx: WindowCx, session: number, h: Harness): boolean
 	local command = if launch_ui() == "tui" then h.tui else h.chat
 	if not command then
@@ -643,7 +700,16 @@ local function open_harness(cx: WindowCx, session: number, h: Harness): boolean
 	local cwd = session_cwd(cx, session)
 	cx.sessions:switch(session)
 	menu = nil
-	local pane = cx.layout:new_tab({ command = command, cwd = cwd }, { focus = true })
+	local launch = { command = command, cwd = cwd }
+	local pane: number?
+	if open_in_tab() then
+		pane = cx.layout:new_tab(launch, { focus = true })
+	else
+		local target = shown_content(cx, session)
+		if target then
+			pane = cx.layout:split(target, "right", launch, { focus = true })
+		end
+	end
 	if not pane then
 		cx:toast("error", "Agent Nav: Could not open " .. h.label, "")
 	end
@@ -718,6 +784,16 @@ local ACTIONS: { [string]: Action } = {
 			return true
 		end,
 	},
+	place = {
+		pattern = "^(%d+):(%a+)$",
+		run = function(_cx, session, value)
+			if not menu or menu.session ~= session or (value ~= "tab" and value ~= "block") then
+				return false
+			end
+			tern.kv.set(KV_OPEN_TAB, value == "tab")
+			return true
+		end,
+	},
 	-- A click can only launch what the menu showed, so `pick` resolves against
 	-- the open menu: a key from an earlier menu does nothing.
 	pick = {
@@ -776,27 +852,35 @@ local function icon_button(key: string, icon: string, title: string): Node
 	})
 end
 
+
 local function session_header(session: number, name: string): Node
 	return ui.el("div", { class = "agent-nav-session-row" }, {
 		ui.el("div", { class = "agent-nav-session", text = name }),
-		icon_button(new_key(session), "plus", "New agent tab"),
+		icon_button(new_key(session), "plus", if open_in_tab() then "New agent tab" else "New agent block"),
 		icon_button(menu_key(session), "more", "Choose a harness"),
+	})
+end
+
+local function switch_row(label: string, key: string, on: boolean): Node
+	return ui.el("div", { class = "agent-nav-mode" }, {
+		ui.el("span", { text = label }),
+		ui.el("button", {
+			key = key, actions = { click = key },
+			class = "agent-nav-mode-switch" .. (if on then " is-on" else ""),
+			attrs = { role = "switch", ["aria-label"] = label, ["aria-checked"] = tostring(on) },
+		}, { ui.el("span", { class = "agent-nav-switch-thumb" }) }),
 	})
 end
 
 local function menu_node(m: Menu): Node
 	local selected = launch_ui()
 	local enabled = selected == "chat"
-	local key = "mode:" .. tostring(m.session) .. ":" .. (if enabled then "tui" else "chat")
+	local mode_key = "mode:" .. tostring(m.session) .. ":" .. (if enabled then "tui" else "chat")
+	local in_tab = open_in_tab()
+	local place_key = "place:" .. tostring(m.session) .. ":" .. (if in_tab then "block" else "tab")
 	local rows: { Node } = {
-		ui.el("div", { class = "agent-nav-mode" }, {
-			ui.el("span", { text = "Enable Tern UI" }),
-			ui.el("button", {
-				key = key, actions = { click = key },
-				class = "agent-nav-mode-switch" .. (if enabled then " is-on" else ""),
-				attrs = { role = "switch", ["aria-label"] = "Enable Tern UI", ["aria-checked"] = tostring(enabled) },
-			}, { ui.el("span", { class = "agent-nav-switch-thumb" }) }),
-		}),
+		switch_row("Enable Tern UI", mode_key, enabled),
+		switch_row("Open in new tab", place_key, in_tab),
 	}
 	for _, h in m.items do
 		local key = pick_key(m.session, h.id)
