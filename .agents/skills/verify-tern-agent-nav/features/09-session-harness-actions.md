@@ -23,6 +23,8 @@ Each workspace header has **+** followed by **…**. The plus button starts omp 
 - A custom agent with a recognizable name has its harness icon. Other names have a UTF-8 first-character avatar.
 - Selecting a built-in in Native TUI mode bypasses Tern's automatic ACP shell wrapper. Tern Chat UI mode opens that agent through `tern acp`.
 - Custom ACP agents launch through their Tern registration so Tern applies their arguments and environment. Tern does not configure a native TUI command for these entries. They are disabled in Native TUI mode.
+- In a window using a separate `TERN_CONFIG_DIR` and `TERN_DAEMON_SOCKET`, custom ACP entries must resolve from that window's profile for new-tab, immediate-block and queued-block launches. Use a unique local registration that is absent from the default profile.
+- A created pane alone is not launch success: require the controlled ACP client's `initialize` and `session/new` handshake, and reject `no agent named` or an immediate nonzero exit. Inspect the target tab before teardown changes the selected session or removes the registration.
 - Workspace labels remain visibly fainter than read, completed agent rows in light and dark themes.
 
 ## Blocked host capabilities

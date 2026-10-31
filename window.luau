@@ -1761,9 +1761,8 @@ type QueuedLaunch = {
 	session: number,
 	tab: number,
 	target: number?,
-	harness: Harness,
-	command: string,
-	cwd: string?,
+	label: string,
+	launch: Launch,
 }
 local queuedLaunches: { QueuedLaunch } = {}
 -- Authoritative agent-block states from cx.agents:list(). Kept across ticks:
@@ -1987,6 +1986,25 @@ local function shell_quote(text: string): string
 	return "'" .. string.gsub(text, "'", "'\\''") .. "'"
 end
 
+local launchPrefix = ""
+do
+	local config = tern.getenv("TERN_CONFIG_DIR")
+	if config ~= nil then
+		launchPrefix = "TERN_CONFIG_DIR=" .. shell_quote(config) .. " "
+	end
+	local socket = tern.getenv("TERN_DAEMON_SOCKET")
+	if socket ~= nil then
+		launchPrefix ..= "TERN_DAEMON_SOCKET=" .. shell_quote(socket) .. " "
+	end
+end
+
+local function launch_spec(cx: WindowCx, command: string, cwd: string?): Launch
+	return {
+		command = if launchPrefix ~= "" and localHost(cx) then launchPrefix .. command else command,
+		cwd = cwd,
+	}
+end
+
 local function badge_of(id: string, label: string): Badge
 	for _, source in { id, label } do
 		local _, icon = harness_icon(source)
@@ -2117,39 +2135,38 @@ local function open_harness(cx: WindowCx, session: number, h: Harness): boolean
 	end
 	menu = nil
 	local in_tab = open_in_tab()
-	if in_tab then
-		local cwd = session_cwd(cx, session)
+	if cx.sessions:current().id ~= session then
 		cx.sessions:switch(session)
-		local launch = { command = command, cwd = cwd }
-		local pane = cx.layout:new_tab(launch, { focus = true })
+	end
+	local cwd = session_cwd(cx, session)
+	if in_tab then
+		local pane = cx.layout:new_tab(launch_spec(cx, command, cwd), { focus = true })
 		if not pane then
 			cx:toast("error", "Agent Nav: Could not open " .. h.label, "")
 		end
 		return true
 	end
 
-	local cwd = session_cwd(cx, session)
-	cx.sessions:switch(session)
 	local tab = shownTab(cx)
-	if not tab then
+	local info = tab and tab_info(cx, tab)
+	if not info or info.session ~= session then
 		cx:toast("error", "Agent Nav: Could not open " .. h.label, "")
 		return true
 	end
 	local target = shown_content(cx, session)
+	local launch = launch_spec(cx, command, cwd)
 
 	if layout_busy() or #queuedLaunches > 0 then
 		table.insert(queuedLaunches, {
 			session = session,
-			tab = tab,
+			tab = info.id,
 			target = target,
-			harness = h,
-			command = command,
-			cwd = cwd,
+			label = h.label,
+			launch = launch,
 		})
 		return true
 	end
 
-	local launch = { command = command, cwd = cwd }
 	local pane: number?
 	if target then
 		pane = cx.layout:split(target, "right", launch, { focus = true })
@@ -2165,7 +2182,6 @@ local function flush_queued_launches(cx: WindowCx): boolean
 		return false
 	end
 	local item = table.remove(queuedLaunches, 1)
-	local cwd = item.cwd or session_cwd(cx, item.session)
 	local info = tab_info(cx, item.tab)
 	local layout = if info and info.session == item.session then cx.session:layout(item.tab) else nil
 	local target = if layout and item.target and in_tree(layout.root, item.target)
@@ -2174,11 +2190,13 @@ local function flush_queued_launches(cx: WindowCx): boolean
 		else nil
 	local pane: number?
 	if target then
-		cx.sessions:switch(item.session)
-		pane = cx.layout:split(target, "right", { command = item.command, cwd = cwd }, { focus = true })
+		if cx.sessions:current().id ~= item.session then
+			cx.sessions:switch(item.session)
+		end
+		pane = cx.layout:split(target, "right", item.launch, { focus = true })
 	end
 	if not pane then
-		cx:toast("error", "Agent Nav: Could not open " .. item.harness.label, "")
+		cx:toast("error", "Agent Nav: Could not open " .. item.label, "")
 	end
 	return true
 end
