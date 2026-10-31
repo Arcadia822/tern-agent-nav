@@ -67,12 +67,15 @@ window = "window.luau"
 """
 
 
-def build_fixture_plugin_window(inspect_path: Path, surface_path: Path, target_file: Path, tmp_cwd: Path) -> str:
+def build_fixture_plugin_window(
+    inspect_path: Path, surface_path: Path, target_file: Path, tmp_cwd: Path, ack_path: Optional[Path] = None
+) -> str:
     """Generate the fixture window.luau embedding absolute target paths as safe literals."""
     inspect_lit = json.dumps(str(inspect_path))
     surface_lit = json.dumps(str(surface_path))
     target_lit = json.dumps(str(target_file))
     cwd_lit = json.dumps(str(tmp_cwd))
+    ack_lit = json.dumps(str(ack_path)) if ack_path else "nil"
 
     return f"""-- Standalone harmless test fixture plugin.
 -- Paths embedded as safe literals to ensure live GUI VM can access them without process env inheritance.
@@ -81,10 +84,17 @@ local inspect_path = {inspect_lit}
 local surface_path = {surface_lit}
 local target_file = {target_lit}
 local tmp_cwd = {cwd_lit}
+local ack_path = {ack_lit}
 
 local created_fixture_panes = {{}}
 local known_agents = {{}}
 local last_created_pane = nil
+
+local function write_ack(payload)
+    if ack_path then
+        tern.fs.write(ack_path, tern.json.encode(payload))
+    end
+end
 
 tern.command({{ id = "inspect_state", title = "Fixture: Inspect State", run = function(cx)
     if not inspect_path then return end
@@ -243,6 +253,11 @@ tern.command({{ id = "create_fixture_agent", title = "Fixture: Create Agent", ru
         last_created_pane = pane
         pcall(function() cx.layout:focus(pane) end)
     end
+    write_ack({{
+        op = "create_fixture_agent",
+        pane = pane,
+        focused = cx.session:focused(),
+    }})
 end }})
 
 for _, dir in {{ "down", "right" }} do
@@ -273,9 +288,34 @@ tern.command({{ id = "focus_target_pane", title = "Fixture: Focus Target Pane", 
     local content = tern.fs.read(target_file)
     if not content then return end
     local target = tonumber(string.match(content, "^%s*(.-)%s*$"))
-    if target and cx.session:pane(target) then
-        cx.layout:focus(target)
+    local ok = false
+    if target then
+        pcall(function()
+            local p_info = cx.session:pane(target)
+            if p_info and p_info.tab then
+                for _, s in cx.session:sessions() do
+                    if s.tabs then
+                        for _, t in s.tabs do
+                            if t == p_info.tab then
+                                if not s.current then
+                                    cx.sessions:switch(s.id)
+                                end
+                                break
+                            end
+                        end
+                    end
+                end
+            end
+            cx.layout:focus(target)
+            ok = true
+        end)
     end
+    write_ack({{
+        op = "focus_target_pane",
+        target = target,
+        ok = ok,
+        focused = cx.session:focused(),
+    }})
 end }})
 
 tern.command({{ id = "close_target_pane", title = "Fixture: Close Target Pane", run = function(cx)
@@ -381,6 +421,23 @@ def text_content(node: Dict[str, Any]) -> str:
     return (node.get("text") or "").strip()
 
 
+
+
+def is_transparent_bg(bg: str) -> bool:
+    if bg.strip().lower() == "transparent":
+        return True
+    match = re.fullmatch(r"rgba\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*([0-9.]+)\s*\)", bg.strip().lower())
+    return bool(match and float(match.group(1)) == 0.0)
+
+
+def is_faint_neutral_grey_bg(bg: str) -> bool:
+    match = re.fullmatch(r"rgba\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*([0-9.]+)\s*\)", bg.strip().lower())
+    if not match:
+        return False
+    red, green, blue, alpha = map(float, match.groups())
+    return red == green == blue and 0.0 < alpha <= 0.15
+
+
 def project_content_tree(tree: Optional[Dict[str, Any]], nav_pane: int) -> Optional[Dict[str, Any]]:
     """Extract the content subtree excluding the navigator pane."""
     if not tree:
@@ -401,24 +458,67 @@ def project_content_tree(tree: Optional[Dict[str, Any]], nav_pane: int) -> Optio
     }
 
 
-def same_content_tree(first: Optional[Dict[str, Any]], second: Optional[Dict[str, Any]]) -> bool:
-    """Compare two projected content trees by pane IDs, split orientations, and ratios with 1e-3 precision."""
+def subtree_cell_span(tree: Optional[Dict[str, Any]], metrics: Dict[int, Any]) -> Tuple[int, int]:
+    """Compute (cols, rows) spanned by a content subtree from native pane metrics."""
+    if not tree:
+        return 0, 0
+    if "pane" in tree:
+        val = metrics.get(tree["pane"], (0, 0))
+        if isinstance(val, dict):
+            return int(val.get("cols", 0)), int(val.get("rows", 0))
+        return int(val[0]), int(val[1])
+    first = tree.get("1") or tree.get("first")
+    second = tree.get("2") or tree.get("second")
+    c1, r1 = subtree_cell_span(first, metrics)
+    c2, r2 = subtree_cell_span(second, metrics)
+    split = tree.get("split")
+    if split == "right":
+        return c1 + c2, max(r1, r2)
+    elif split == "down":
+        return max(c1, c2), r1 + r2
+    return max(c1, c2), max(r1, r2)
+
+
+def same_content_tree(
+    first: Optional[Dict[str, Any]],
+    second: Optional[Dict[str, Any]],
+    metrics: Optional[Union[Dict[int, Any], Callable[[], Dict[int, Any]]]] = None,
+) -> bool:
+    """Compare two projected content trees by pane IDs, split orientations, and ratios.
+
+    Ratios match if they differ by < 1e-3, or under discrete integer-cell quantization,
+    if the ratio difference corresponds to within 0.5 cells of the subtree's native span.
+    """
     if not first or not second:
         return first == second
     if "pane" in first or "pane" in second:
         return first.get("pane") == second.get("pane")
+    if first.get("split") != second.get("split"):
+        return False
+
+    resolved_metrics = metrics
+    diff = abs(first.get("ratio", 0.5) - second.get("ratio", 0.5))
+    if diff >= 1e-3:
+        if callable(metrics):
+            resolved_metrics = metrics()
+        if not resolved_metrics:
+            return False
+        split = first.get("split")
+        c, r = subtree_cell_span(second, resolved_metrics)
+        span = c if split == "right" else r
+        if span <= 0 or (diff * span) > 0.5 + 1e-3:
+            return False
+
     return (
-        first.get("split") == second.get("split")
-        and abs(first.get("ratio", 0.5) - second.get("ratio", 0.5)) < 1e-3
-        and same_content_tree(first.get("first"), second.get("first"))
-        and same_content_tree(first.get("second"), second.get("second"))
+        same_content_tree(first.get("first"), second.get("first"), resolved_metrics)
+        and same_content_tree(first.get("second"), second.get("second"), resolved_metrics)
     )
 
 
 class SmokeRunner:
     """Regression runner operating in isolated fixture sessions against an existing Tern GUI window."""
 
-    TOUCHED_KEYS = ("agent_nav.enabled", "agent_nav.side", "agent_nav.width")
+    TOUCHED_KEYS = ("agent_nav.enabled", "agent_nav.side", "agent_nav.share")
 
     def __init__(self, args: argparse.Namespace):
         if sys.platform == "darwin":
@@ -458,12 +558,13 @@ class SmokeRunner:
         self.inspect_path: Optional[Path] = None
         self.surface_path: Optional[Path] = None
         self.target_file: Optional[Path] = None
-
+        self.ack_path: Optional[Path] = None
         self.original_session_id: Optional[int] = None
         self.original_session_name: Optional[str] = None
         self.original_host: Optional[Dict[str, Any]] = None
         self.original_focused_pane: Optional[int] = None
         self.original_viewport: Optional[Tuple[int, int]] = None
+        self.baseline_ratio: Optional[float] = None
         self.kv_path: Optional[Path] = None
         self.original_kv_bytes: Optional[bytes] = None
         self.original_kv_data: Dict[str, Any] = {}
@@ -543,13 +644,14 @@ class SmokeRunner:
         self.inspect_path = self.base / "fixture_inspect.json"
         self.surface_path = self.base / "fixture_surface.json"
         self.target_file = self.base / "fixture_target.txt"
+        self.ack_path = self.base / "fixture_ack.json"
 
         fixture_dir = self.base / "fixture-plugin"
         fixture_dir.mkdir()
         (fixture_dir / "plugin.toml").write_text(FIXTURE_PLUGIN_TOML)
         # Embed absolute target paths directly in Lua source so live GUI process needs no env injection
         fixture_source = build_fixture_plugin_window(
-            self.inspect_path, self.surface_path, self.target_file, self.base,
+            self.inspect_path, self.surface_path, self.target_file, self.base, self.ack_path,
         )
         (fixture_dir / "window.luau").write_text(fixture_source)
 
@@ -605,7 +707,7 @@ class SmokeRunner:
 
         # 6. Create isolated fixture session for test execution on local host via window SDK
         self.create_session(self.alpha_session_name)
-        # 7. Ensure clean navigator baseline in test session (enabled, pinned right, 220px)
+        # 7. Ensure clean navigator baseline in test session (enabled, pinned right, default ratio)
         self.ensure_initial_nav_state()
         state = self.inspect_sdk_state()
         current = next((s for s in state.get("sessions", []) if s.get("current")), None)
@@ -616,22 +718,26 @@ class SmokeRunner:
         print("Isolated fixture session online and baseline verified.")
 
     def ensure_initial_nav_state(self):
-        """Ensure navigator is enabled, on the right side, and settles at default 220px."""
+        """Ensure navigator is enabled, pinned right, and at the default share."""
         if len(self.visible(".agent-nav-root")) == 0:
             self.ctl("key", "ctrl+alt+n")
-            self.ctl("wait", "250")
+        self.wait_until(self.is_singleton, "Fixture navigator did not attach to the active tab")
         self.ctl("palette", "Agent Nav: Reset Width")
-        self.ctl("wait", "150")
         self.ctl("key", "enter")
-        self.ctl("wait", "250")
-        if len(self.visible(".agent-nav-root")) == 1:
-            rx, _, rw, _ = self.nav_bounds()
-            sx, _, sw, _ = self.visible(".tn-stage")[0]["rect"]
-            if abs((rx + rw) - (sx + sw)) > 10.0:
-                self.ctl("palette", "Agent Nav: Toggle left / right")
-                self.ctl("wait", "150")
-                self.ctl("key", "enter")
-                self.ctl("wait", "250")
+
+        def pinned_right():
+            state = self.inspect_sdk_state()
+            canvases = state.get("nav_canvases", [])
+            root = (state.get("layout") or {}).get("root") or {}
+            edge = root.get("2") or root.get("second") or {}
+            return len(canvases) == 1 and root.get("split") == "right" and edge.get("pane") == canvases[0]["pane"]
+
+        if not pinned_right():
+            self.ctl("palette", "Agent Nav: Toggle left / right")
+            self.ctl("key", "enter")
+        self.wait_until(pinned_right, "Fixture navigator did not reach the native right edge")
+        self.wait_visible_ratio(0.2, "Fixture navigator did not settle at the default share")
+
     def teardown(self):
         print("\nTearing down test environment and restoring caller state...")
 
@@ -864,6 +970,37 @@ class SmokeRunner:
         if len(self.visible(".agent-nav-root")) != 1:
             return None
         return self.nav_bounds()[2]
+    def nav_ratio(self) -> Optional[float]:
+        """Measure the navigator's visible rail share relative to the active stage."""
+        w = self.nav_physical_width()
+        if w is None or w <= 0:
+            return None
+        stages = self.visible(".tn-stage")
+        if not stages:
+            return None
+        sw = float(stages[0]["rect"][2])
+        if sw <= 0:
+            return None
+        return w / sw
+
+    def wait_visible_ratio(
+        self,
+        target: Union[float, Callable[[float], bool]],
+        message: str,
+        timeout: float = 20.0,
+        tolerance: float = 0.01,
+    ) -> float:
+        """Wait for the visible rail/stage ratio to match target within tolerance or satisfy a predicate."""
+        def check():
+            r = self.nav_ratio()
+            if r is None:
+                return None
+            if callable(target):
+                return r if target(r) else None
+            return r if abs(r - target) <= tolerance else None
+
+        return self.wait_until(check, message, timeout=timeout)
+
 
     def wait_visible_width(self, target: Union[float, Callable[[float], bool]], message: str, timeout: float = 20.0) -> float:
         def check():
@@ -902,9 +1039,26 @@ class SmokeRunner:
         return nav_canvases[0]["pane"]
 
     def focus_pane(self, pane_id: int):
+        self.ack_path.unlink(missing_ok=True)
         self.target_file.write_text(str(pane_id))
         self.ctl("plugins", "run", "plugin.agent-nav-smoke-fixture.focus_target_pane")
-        self.ctl("wait", "100")
+
+        def ack_received():
+            if not self.ack_path.exists():
+                return False
+            try:
+                data = json.loads(self.ack_path.read_text())
+                return data.get("op") == "focus_target_pane" and data.get("target") == pane_id
+            except Exception:
+                return False
+
+        self.wait_until(ack_received, f"focus_target_pane did not write ack for pane {pane_id}", timeout=5.0)
+
+        def is_focused():
+            state = self.inspect_sdk_state()
+            return state.get("focused") == pane_id
+
+        self.wait_until(is_focused, f"Pane {pane_id} did not become focused in SDK state", timeout=5.0)
 
     def click_element(self, node: Dict[str, Any], token: Optional[str] = None) -> Dict[str, Any]:
         x, y, w, h = node["rect"]
@@ -919,20 +1073,47 @@ class SmokeRunner:
 
     def create_agent(self, title: str, how: str = "tab") -> int:
         """Create a fixture agent running /bin/cat (no model invocation) using cx.agents:start."""
+        self.ack_path.unlink(missing_ok=True)
         self.target_file.write_text(how)
         self.ctl("plugins", "run", "plugin.agent-nav-smoke-fixture.create_fixture_agent")
-        self.ctl("wait", "200")
-        state = self.inspect_sdk_state()
-        pane = state.get("last_created_pane") or state.get("focused")
-        assert pane is not None, "Failed to create fixture agent pane"
+
+        def read_ack():
+            if not self.ack_path.exists():
+                return None
+            try:
+                data = json.loads(self.ack_path.read_text())
+                if data.get("op") == "create_fixture_agent" and "pane" in data:
+                    return data
+            except Exception:
+                pass
+            return None
+
+        ack_data = self.wait_until(read_ack, f"create_fixture_agent did not write ack for {title}", timeout=5.0)
+        pane = ack_data.get("pane")
+        assert pane is not None, f"create_fixture_agent returned nil pane for {title}"
         self.fixture_panes.add(pane)
+
+        # Ensure pane is focused before feeding OSC 2 title
+        self.focus_pane(pane)
 
         # Set title via standard OSC 2 sequence directed to the fixture agent pane
         feed_file = self.base / f"title_feed_{pane}.txt"
         feed_file.write_text(f"\x1b]2;{title}\x1b\\")
-        self.focus_pane(pane)
         self.ctl("feed", str(feed_file))
-        self.ctl("wait", "200")
+
+        def title_applied():
+            st = self.inspect_sdk_state()
+            for p in st.get("panes", []):
+                if p.get("pane") == pane and p.get("title") == title:
+                    return True
+            return False
+
+        self.wait_until(
+            title_applied,
+            f"Pane {pane} title was not updated to '{title}' via feed",
+            timeout=5.0,
+            interval=0.1,
+        )
 
         state = self.inspect_sdk_state()
         assert any(p["pane"] == pane and p["kind"] == "agent" for p in state["panes"]), f"Pane {pane} not registered as agent"
@@ -953,7 +1134,9 @@ class SmokeRunner:
         edge = root.get("2") or root.get("second") or {}
         assert edge.get("pane") == state["nav_canvases"][0]["pane"], f"Navigator absent from native right edge: {root}"
         assert project_content_tree(root, edge["pane"]), "Native split lost the original content panes"
-        w = self.wait_visible_width(220.0, "Default navigator did not settle at 220px")
+        self.baseline_ratio = self.wait_until(
+            self.nav_ratio, "Navigator has no measurable visible share"
+        )
         sx, _, sw, _ = self.visible(".tn-stage")[0]["rect"]
         rx, _, rw, _ = self.nav_bounds()
         assert abs((rx + rw) - (sx + sw)) < 3.0, f"Navigator not pinned to stage right edge: rail={rx, rw}, stage={sx, sw}"
@@ -968,7 +1151,7 @@ class SmokeRunner:
         self.ctl("key", "ctrl+alt+n")
         self.wait_until(lambda: len(self.visible(".agent-nav-root")) == 1,
                         "Key chord ctrl+alt+n did not toggle on navigator")
-        self.wait_visible_width(220.0, "Navigator restored via chord did not measure 220px")
+        self.wait_visible_ratio(self.baseline_ratio, "Navigator restored via chord did not maintain baseline ratio")
 
         # 3. Native Command Palette: Agent Nav: Toggle left / right
         root_before = self.nav_panel()
@@ -981,7 +1164,7 @@ class SmokeRunner:
         root_left = self.nav_panel()
         lx, _, _, _ = root_left["rect"]
         assert lx < bx, f"Command palette toggle_side did not move left: before x={bx}, after x={lx}"
-        self.wait_visible_width(220.0, "Navigator altered width when moved to left side")
+        self.wait_visible_ratio(self.baseline_ratio, "Navigator altered ratio when moved to left side")
 
         # Palette toggle back to right side
         self.ctl("palette", "Agent Nav: Toggle left / right")
@@ -992,7 +1175,7 @@ class SmokeRunner:
         root_right = self.nav_panel()
         rx, _, _, _ = root_right["rect"]
         assert rx > lx, f"Command palette toggle_side did not return right: left x={lx}, right x={rx}"
-        self.wait_visible_width(220.0, "Navigator altered width when moved back to right side")
+        self.wait_visible_ratio(self.baseline_ratio, "Navigator altered ratio when moved back to right side")
 
     def test_viewport_resize_stability(self):
         stage = self.ctl("dump", ".tn-stage")["header"]["viewport"]
@@ -1000,51 +1183,75 @@ class SmokeRunner:
 
         for target_w in (orig_w + 240, orig_w):
             self.ctl("resize", str(target_w), str(orig_h))
-            self.wait_visible_width(220.0, f"Resizing viewport to {target_w}px caused navigator width drift")
+            self.wait_visible_ratio(self.baseline_ratio, f"Resizing viewport to {target_w}px did not maintain navigator ratio")
             cur_stage_w = int(self.ctl("dump", ".tn-stage")["header"]["viewport"]["width"])
             assert cur_stage_w == target_w, f"Viewport width mismatch: {cur_stage_w} != {target_w}"
-
+            cur_w = self.nav_physical_width()
+            expected_w = self.baseline_ratio * target_w
+            assert cur_w is not None and abs(cur_w - expected_w) <= max(target_w * 0.025, 5.0), (
+                f"Navigator width did not scale proportionally with stage: cur={cur_w}, expected={expected_w}"
+            )
     def test_real_divider_drag_and_memory(self):
         rx, ry, _, rh = self.nav_bounds()
         divider_x = round(rx - 1)
         divider_y = round(ry + rh / 2)
+        before_ratio = self.nav_ratio()
+        assert before_ratio is not None, "Could not determine pre-drag navigator ratio"
+
         self.ctl("down", str(divider_x), str(divider_y))
         self.ctl("move", str(divider_x - 50), str(divider_y))
         self.ctl("up")
 
-        dragged_width = self.wait_visible_width(
-            lambda width: abs(width - 220.0) > 3.0,
-            "Real divider drag did not adjust navigator width from 220px",
+        dragged_ratio = self.wait_visible_ratio(
+            lambda r: abs(r - before_ratio) > 0.02,
+            "Real divider drag did not adjust navigator ratio",
             timeout=10,
         )
 
-        def remembered_width():
+        def remembered_share():
             if self.kv_path and self.kv_path.exists():
                 try:
                     data = json.loads(self.kv_path.read_text())
-                    width = data.get("agent_nav.width")
-                    if isinstance(width, (int, float)) and abs(width - dragged_width) < 1.0:
+                    persisted = data.get("agent_nav.share")
+                    if isinstance(persisted, (int, float)) and abs(persisted - dragged_ratio) <= 0.03:
                         return True
                 except Exception:
                     pass
             return False
 
-        self.wait_until(remembered_width, "Dragged width was not saved as the user preference")
+        self.wait_until(remembered_share, "Dragged ratio was not saved as agent_nav.share preference")
 
-        # Viewport resize must remember user's dragged width
+        # Verify persisted share matches native split layout ratio
+        state = self.inspect_sdk_state()
+        layout_root = (state.get("layout") or {}).get("root") or {}
+        assert layout_root.get("split") == "right", f"Missing native rail split: {layout_root}"
+        is_left = (layout_root.get("1") or layout_root.get("first") or {}).get("pane") == state["nav_canvases"][0]["pane"]
+        layout_ratio = float(layout_root.get("ratio", 0.5))
+        expected_share = layout_ratio if is_left else (1.0 - layout_ratio)
+        persisted_share = json.loads(self.kv_path.read_text()).get("agent_nav.share")
+        assert abs(persisted_share - expected_share) <= 0.03, (
+            f"agent_nav.share ({persisted_share}) does not match native layout ratio ({expected_share})"
+        )
+
+        # Viewport resize must scale proportionally and preserve user's dragged ratio
         stage = self.ctl("dump", ".tn-stage")["header"]["viewport"]
         orig_w, orig_h = int(stage["width"]), int(stage["height"])
         self.ctl("resize", str(orig_w + 200), str(orig_h))
-        self.wait_visible_width(dragged_width, "Manual width not preserved across viewport resize")
+        self.wait_visible_ratio(dragged_ratio, "Manual dragged ratio not preserved across viewport resize")
         self.ctl("resize", str(orig_w), str(orig_h))
-        self.wait_visible_width(dragged_width, "Manual width not preserved after restoring viewport")
+        self.wait_visible_ratio(dragged_ratio, "Manual dragged ratio not preserved after restoring viewport")
 
-        # Palette: Agent Nav: Reset Width restores 220px
+        # Palette: Agent Nav: Reset Width restores initial default layout ratio
         self.ctl("palette", "Agent Nav: Reset Width")
         self.ctl("wait", "150")
         self.ctl("key", "enter")
         self.ctl("wait", "250")
-        self.wait_visible_width(220.0, "Reset Width command did not restore 220px")
+        self.wait_visible_ratio(self.baseline_ratio, "Reset Width command did not restore initial default layout ratio")
+        if self.kv_path and self.kv_path.exists():
+            data = json.loads(self.kv_path.read_text())
+            assert data.get("agent_nav.share") is None, (
+                f"Reset Width did not clear agent_nav.share from kv.json: {data.get('agent_nav.share')}"
+            )
 
     def test_tabs_and_sessions_exact_mapping(self):
         # In isolated self.alpha_session_name:
@@ -1066,6 +1273,7 @@ class SmokeRunner:
 
         # 1. Enforce strict singleton invariant across tabs and sessions
         assert self.is_singleton(), "Must maintain exactly 1 navigator canvas in active tab across tabs and sessions"
+        self.wait_visible_ratio(self.baseline_ratio, "Navigator did not maintain baseline ratio across tabs and sessions")
 
         # 2. Exact group and row match for fixture-created sessions
         expected_groups = [
@@ -1129,6 +1337,7 @@ class SmokeRunner:
 
         self.wait_until(check_jump, f"Pointer click did not jump across sessions to {self.alpha_session_name}", timeout=10)
         assert self.is_singleton(), "Singleton navigator preserved after cross-session jump"
+        self.wait_visible_ratio(self.baseline_ratio, "Navigator did not maintain baseline ratio after cross-session jump")
         assert self.get_nav_pane_id() == nav_pane_before, "Navigator pane ID mutated during jump"
         after = self.inspect_sdk_state()
         assert after["layouts"][str(source_tab)]["focus"] == self.agent_panes["Beta Agent"]
@@ -1210,6 +1419,12 @@ class SmokeRunner:
         titles = {p["pane"]: p["title"] for p in settled["panes"] if p["pane"] in leaves(golden)}
         tab_title = next(t["title"] for t in settled["tabs"] if t["id"] == origin_tab)
 
+        def current_metrics():
+            return {
+                (p.get("id") or p.get("pane")): (p.get("cols", 0), p.get("rows", 0))
+                for p in self.ctl("state").get("panes", [])
+            }
+
         def preserved():
             state = self.inspect_sdk_state()
             if state["current_tab"] != origin_tab or not self.is_singleton(state):
@@ -1218,7 +1433,7 @@ class SmokeRunner:
             children = [root.get("1", {}), root.get("2", {})]
             if root.get("split") != "right" or not any(child.get("pane") == nav for child in children):
                 return False
-            if not same_content_tree(golden, content(state)) or state["focused"] != first:
+            if not same_content_tree(golden, content(state), metrics=current_metrics) or state["focused"] != first:
                 return False
             assert {p["pane"]: p["title"] for p in state["panes"] if p["pane"] in titles} == titles
             assert next(t["title"] for t in state["tabs"] if t["id"] == origin_tab) == tab_title
@@ -1227,8 +1442,8 @@ class SmokeRunner:
         for _ in range(2):
             self.ctl("palette", "Agent Nav: Toggle left / right")
             self.ctl("key", "enter")
-            self.wait_visible_width(220.0, "Mixed content attachment changed navigator width")
-
+            self.wait_visible_ratio(self.baseline_ratio, "Mixed content attachment changed navigator ratio")
+            self.wait_until(preserved, "Side toggle did not preserve mixed content tree")
         # Edit internal divider after settled then side-toggle: verify latest tree preserved
         self.target_file.write_text(f"{first} right -2")
         self.ctl("plugins", "run", "plugin.agent-nav-smoke-fixture.resize_content")
@@ -1259,16 +1474,20 @@ class SmokeRunner:
         other_tab = next(t for t in settled["tabs"] if t["session"] == origin_session and t["id"] != origin_tab)
         self.ctl("tab", str(other_tab["position"]))
         self.wait_until(self.is_singleton, "Navigator did not follow another tab")
+        self.wait_visible_ratio(self.baseline_ratio, "Navigator altered ratio following another tab")
         self.ctl("tab", str(origin["position"]))
         self.wait_until(preserved, "Tab round trip changed mixed content")
+        self.wait_visible_ratio(self.baseline_ratio, "Tab round trip altered navigator ratio")
 
         # Session round trip
         other_session = next(s for s in settled["sessions"] if s["id"] != origin_session and s["name"] in self.fixture_sessions)
         origin_name = next(s["name"] for s in settled["sessions"] if s["id"] == origin_session)
         self.switch_session(other_session["name"])
         self.wait_until(self.is_singleton, "Navigator did not follow another session")
+        self.wait_visible_ratio(self.baseline_ratio, "Navigator altered ratio following another session")
         self.switch_session(origin_name)
         self.wait_until(preserved, "Session round trip changed mixed content")
+        self.wait_visible_ratio(self.baseline_ratio, "Session round trip altered navigator ratio")
 
         # Close fixture-created splits and verify original content restored
         for pane in reversed(created):
@@ -1276,7 +1495,7 @@ class SmokeRunner:
             self.ctl("plugins", "run", "plugin.agent-nav-smoke-fixture.close_target_pane")
             self.fixture_panes.discard(pane)
 
-        self.wait_until(lambda: same_content_tree(baseline, content(self.inspect_sdk_state())),
+        self.wait_until(lambda: same_content_tree(baseline, content(self.inspect_sdk_state()), metrics=current_metrics),
                         "Closing fixture-created splits did not restore original content")
         self.wait_until(self.is_singleton, "Fixture cleanup lost navigator")
 
@@ -1303,7 +1522,7 @@ class SmokeRunner:
         # Re-enable via chord
         self.ctl("key", "ctrl+alt+n")
         self.wait_until(lambda: len(self.visible(".agent-nav-root")) == 1, "Chord did not re-enable navigator")
-        self.wait_visible_width(220.0, "Re-enabled navigator did not adopt 220px")
+        self.wait_visible_ratio(self.baseline_ratio, "Re-enabled navigator did not adopt baseline ratio")
 
     def test_parent_tab_close_recreates(self):
         tabs_before = len(self.inspect_sdk_state().get("tabs", []))
@@ -1314,7 +1533,7 @@ class SmokeRunner:
 
         # Navigator must be adopted/recreated on surviving tab
         assert self.is_singleton(), "Navigator was not recreated/adopted on surviving tab after tab close"
-        self.wait_visible_width(220.0, "Navigator on surviving tab did not maintain 220px")
+        self.wait_visible_ratio(self.baseline_ratio, "Navigator on surviving tab did not maintain baseline ratio")
 
     def test_parent_session_close_recreates(self):
         before = self.inspect_sdk_state()
@@ -1323,7 +1542,7 @@ class SmokeRunner:
         self.create_agent("Gamma Agent", how="tab")
         self.wait_until(self.is_singleton, "Navigator did not follow disposable session")
         gamma_id = self.inspect_sdk_state()["current_session"]
-        self.wait_visible_width(220.0, "Navigator in disposable session did not settle at 220px")
+        self.wait_visible_ratio(self.baseline_ratio, "Navigator in disposable session did not settle at baseline ratio")
 
         # Close session
         self.close_session(self.gamma_session_name)
@@ -1340,7 +1559,7 @@ class SmokeRunner:
         after = self.wait_until(survivor, "Closing parent session did not restore navigator on survivor")
         assert surviving_ids <= {pane["pane"] for pane in after["panes"]}, "Session close removed surviving content"
         assert after["focused"] != self.get_nav_pane_id(), "Navigator took survivor content focus"
-        self.wait_visible_width(220.0, "Survivor navigator did not maintain 220px")
+        self.wait_visible_ratio(self.baseline_ratio, "Survivor navigator did not maintain baseline ratio")
 
     def test_plugin_reload_adoption(self):
         nav_pane_before = self.get_nav_pane_id()
@@ -1348,6 +1567,7 @@ class SmokeRunner:
         self.ctl("wait", "300")
         assert self.is_singleton(), "Singleton violated after plugin reload"
         assert self.get_nav_pane_id() == nav_pane_before, "Reload failed to adopt existing canvas pane ID"
+        self.wait_visible_ratio(self.baseline_ratio, "Reload failed to maintain navigator ratio")
 
     def test_event_storms_reconciliation(self):
         for _ in range(3):
@@ -1359,12 +1579,12 @@ class SmokeRunner:
         time.sleep(0.3)
         self.ctl("wait", "200")
         assert self.is_singleton(), "Event storm left invalid canvas state"
-        self.wait_visible_width(220.0, "Event storm corrupted navigator width")
+        self.wait_visible_ratio(self.baseline_ratio, "Event storm corrupted navigator ratio")
 
     def test_native_tsp_five_state_fixture(self):
-        wire_path = self.base / "status-wire.bin"
         title = "Native State Fixture"
-        pane = self.create_agent(title, how="tab")
+        wire_path = self.base / "status-wire.bin"
+        pane = self.create_agent(title, how="split")
         native = self.inspect_sdk_state()
         other = next(p["pane"] for p in native["panes"] if p["tab"] == native["current_tab"] and p["pane"] not in (pane, native["nav_canvases"][0]["pane"]))
         sequence = 0
@@ -1395,6 +1615,75 @@ class SmokeRunner:
                 return rows[0] if len(rows) == 1 else False
             self.wait_until(matched, f"Fixture pane {pane} did not render status-{status}")
 
+
+        focused_background: Optional[str] = None
+
+        def verify_row_styles(expected_status: str):
+            nonlocal focused_background
+            # 1. Shimmer assertion on running text
+            if expected_status == "running":
+                shimmers = self.visible(".agent-nav-agent.status-running .agent-nav-title .sf-shimmer")
+                assert len(shimmers) >= 1, f"Expected text shimmer on running agent row '{title}', but found none"
+            else:
+                shimmers = self.visible(f".agent-nav-agent.status-{expected_status} .agent-nav-title .sf-shimmer")
+                assert len(shimmers) == 0, f"Status '{expected_status}' must not render text shimmer"
+
+            # 2. Focus targets: in done-unread, focusing pane clears unread to read,
+            # so only test other (non-current) for done-unread; test both for other states.
+            focus_targets = [other] if expected_status == "done-unread" else [pane, other]
+            initial_focus = self.inspect_sdk_state().get("focused")
+
+            for f_target in focus_targets:
+                focus(f_target)
+                self.ctl("wait", "100")
+
+                target_rows = [r for r in self.visible(".agent-nav-agent") if title in text_content(r)]
+                assert len(target_rows) == 1, f"Could not find exact agent row for '{title}'"
+                t_row = target_rows[0]
+                rx, ry, rw, rh = t_row["rect"]
+                cx, cy = round(rx + rw / 2), round(ry + rh / 2)
+
+                # Exercise pointer and keyboard input without assuming a DOM focus target.
+                for inter in ("normal", "hover", "pressed", "keyboard"):
+                    if inter == "normal":
+                        self.ctl("move", "0", "0")
+                    elif inter == "hover":
+                        self.ctl("move", str(cx), str(cy))
+                    elif inter == "pressed":
+                        self.ctl("down", str(cx), str(cy))
+                    elif inter == "keyboard":
+                        self.ctl("up")
+                        self.ctl("key", "tab")
+                    self.ctl("wait", "50")
+
+                    dump_elements = self.dump(".agent-nav-agent")
+                    assert dump_elements, "ctl dump returned no .agent-nav-agent elements"
+
+                    for el in dump_elements:
+                        is_cur = ".is-current" in el["path"].rsplit(">", 1)[-1]
+                        bg = el["backgroundColor"]
+
+                        if is_cur:
+                            assert is_faint_neutral_grey_bg(bg), (
+                                f"Current agent row (status={expected_status}, focus_target={f_target}, interaction={inter}) "
+                                f"must have a faint neutral grey background, got '{bg}'"
+                            )
+                            if focused_background is None:
+                                focused_background = bg
+                            assert bg == focused_background, "Focused row background changed with agent state or interaction"
+                        else:
+                            assert is_transparent_bg(bg), (
+                                f"Non-current agent row (status={expected_status}, focus_target={f_target}, interaction={inter}) "
+                                f"must have transparent background, got '{bg}'"
+                            )
+
+                    if inter == "pressed":
+                        self.ctl("up")
+                self.ctl("move", "0", "0")
+
+            if initial_focus and initial_focus != self.inspect_sdk_state().get("focused"):
+                focus(initial_focus)
+            assert focused_background is not None, "No focused agent row background was observed"
         nodes = [
             ("main", "state-fixture", {}), ("dock", "state-fixture", {}),
             ("layer", "state-fixture", {}),
@@ -1405,6 +1694,7 @@ class SmokeRunner:
         ops = [["add", key, parent, None, {"id": key, "k": "col", "p": props}] for key, parent, props in nodes]
         emit(apc("o", {"id": "state-fixture", "mode": "inline", "title": title}) + frame(ops) + osc("working"))
         expect("running")
+        verify_row_styles("running")
 
         self.target_file.write_text(str(pane))
         self.surface_path.unlink(missing_ok=True)
@@ -1418,13 +1708,10 @@ class SmokeRunner:
             exact = sample[region]["main"]
             assert exact["id"] == roots[region]["id"] and exact.get("c"), "Discovered exact root must resolve"
 
-        emit(frame([["set", "hidden_wrap", {"hidden": False}]]))
-        expect("attention")
-        emit(frame([["set", "hidden_wrap", {"hidden": True}]]))
-        expect("running")
         emit(frame([["set", "composer", {"state": "waiting"}]]))
         emit(osc("blocked:kind=question"))
         expect("attention")
+        verify_row_styles("attention")
         native = self.inspect_sdk_state()
         assert any(a["pane"] == pane and a["state"] == "waiting_input" for a in native["agents"])
 
@@ -1432,10 +1719,13 @@ class SmokeRunner:
         emit(frame([["set", "composer", {"state": "idle"}]]))
         emit(osc("done") + b"\x07")
         expect("done-unread")
+        verify_row_styles("done-unread")
         focus(pane)
         expect("done-read")
+        verify_row_styles("done-read")
         emit(osc("error"))
         expect("error")
+        verify_row_styles("error")
         emit(frame([["set", "composer", {"state": "working"}]]))
         emit(osc("working"))
         expect("running")
@@ -1443,6 +1733,7 @@ class SmokeRunner:
         self.ctl("alert", "exited", "1")
         focus(other)
         expect("error")
+        verify_row_styles("error")
 
     def test_native_tsp_latency_batch_fixture(self):
         """Bounded-round state-only NativeTSP latency test covering at least 8 known fixture agents.
@@ -1554,7 +1845,7 @@ class SmokeRunner:
         remote_id = remote["current_host"]["id"]
         self.fixture_hosts.add(remote_name)
 
-        self.wait_visible_width(220.0, "Remote navigator did not settle at 220px")
+        self.wait_visible_ratio(self.baseline_ratio, "Remote navigator did not settle at baseline ratio")
 
         # Verify old host canvas was retired on host switch
         cur_canvases = [c["pane"] for c in self.inspect_sdk_state().get("nav_canvases", [])]
@@ -1569,7 +1860,7 @@ class SmokeRunner:
                             f"Remote host never entered {link_state}")
 
         self.wait_until(self.is_singleton, "Navigator did not recover after reconnect")
-        self.wait_visible_width(220.0, "Reconnect changed navigator width")
+        self.wait_visible_ratio(self.baseline_ratio, "Reconnect changed navigator ratio")
         self.ctl("remote", "identity", remote_name, "fixture-peer", "ssh-key", "127.0.0.1", "smoke")
         self.wait_until(self.is_singleton, "Identity replacement left an invalid remote navigator")
         self.ctl("remote", "switch", origin["name"])
@@ -1585,7 +1876,7 @@ class SmokeRunner:
         after_panes = {p["pane"] for p in after["panes"]}
         assert origin_content_panes <= after_panes, "Host round trip lost origin content panes"
         assert self.is_singleton(), "Singleton navigator not maintained on returned host"
-        self.wait_visible_width(220.0, "Host round trip changed remembered width")
+        self.wait_visible_ratio(self.baseline_ratio, "Host round trip changed remembered ratio")
 
         # Forget the test host using cx.hosts:disconnect
         self.target_file.write_text(str(remote_id))
@@ -1611,7 +1902,7 @@ class SmokeRunner:
 
         self.ctl("wait", "200")
         assert self.is_singleton(), "Navigator lost singleton during soak run"
-        self.wait_visible_width(220.0, "Navigator width drifted during soak run")
+        self.wait_visible_ratio(self.baseline_ratio, "Navigator ratio drifted during soak run")
         print(f"Soak completed: {cycles} cycles with zero state drift.")
 
     def verify_no_budget_or_handler_failures(self):

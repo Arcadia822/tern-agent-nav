@@ -42,6 +42,9 @@ Rail share from `tern ls --json`: `ratio` when the canvas is split node `a` (lef
 - kv.json flushes lazily — read it a few seconds after the action, and don't conclude from one
   read that a command failed.
 - `plugins run` acks `{"ok":true}` even for unknown actions; trust observed state changes only.
+- Before checking startup geometry, wait until the native layout places the navigator at the
+  requested edge and reports its default share. A fixed 250 ms wait and stale canvas bounds
+  can misidentify the side while the 750 ms follow timer is still settling.
 
 ## Multi-block regression checkpoint (2026-10-30)
 
@@ -58,6 +61,11 @@ Rail share from `tern ls --json`: `ratio` when the canvas is split node `a` (lef
 
 Before the fix the four-block case saved `agent_nav.share: 0.5` and left the rail
 at 50%. The fixed code kept it near 0.2 without writing the key.
+
+5. Wait for content restoration after each side change before editing another
+   divider. Compare pane IDs, split directions and hierarchy exactly; allow at
+   most half a native cell of ratio quantization, using the current pane grid
+   sizes rather than a fixed fractional tolerance.
 
 ## Proof (2026-10-20 pass)
 

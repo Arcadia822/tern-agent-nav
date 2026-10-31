@@ -6,9 +6,9 @@
   working label uses — rendered via a `shimmer` node (`mode = "classic"`), never a CSS background
   sweep or a glyph position/size animation (`build_view` lines 603–609).
 - Shimmer colors come from `--sh-*` in `styles.css`: all phases are opaque.
-  Light mode uses dark amber text with a darker sweep over a static bright yellow
-  row background. Dark mode uses amber text with a brighter sweep. Color themes
-  must not replace the semantic amber or reduce text opacity during the sweep.
+  Light mode uses dark amber text with a darker sweep; dark mode uses amber
+  text with a brighter sweep. Running never adds a row background. Only the
+  focused agent row has a fixed faint neutral fill, independent of status.
 - Only the running row shimmers; other rows are static.
 
 ## How to get to it (user POV)
@@ -34,8 +34,8 @@ $W 'record stop'
   turn runs.
 - A pane with native agent state `working` is running (`build_view` lines 505–529); terminal
   agents without state need `busy`/`at_prompt`/spinner-title/screen hints.
-- Only the text animates (`.agent-nav-title .sf-shimmer`). The light-mode yellow
-  row background is a static state cue, never an animated background sweep.
+- Only the text animates (`.agent-nav-title .sf-shimmer`). Backgrounds never animate
+  or change with agent status; the focused row alone has a faint neutral fill.
 
 ## Proof (2026-10-20 pass)
 

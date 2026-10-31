@@ -41,6 +41,11 @@ sleep 4   # ready when /tmp/nav-verify.sock exists and `ctl state` answers
 Ready signal: `/tmp/nav-verify.sock` exists and
 `tern ctl --control /tmp/nav-verify.sock state` returns JSON with `"ok": true`.
 
+On macOS, activate the dedicated verification process before reading canvas trees, styles or
+screenshots. A background process can accept control commands and advance native state while
+its rendered tree and screenshots retain an old frame. Compare the visible session with
+`ctl state`; activate only the recorded sandbox PID if they differ.
+
 Teardown is in **Cleanup**. Note the launch order: daemon first, window second; the window's
 `window_start` triggers the plugin's first `follow` (panel mounts in the window's shown tab).
 

@@ -2,7 +2,6 @@
    color themes, with separate light/dark values for readable status text. */
 .agent-nav-root {
     --agent-nav-running: light-dark(#854d0e, #f5a524);
-    --agent-nav-running-bg: light-dark(#ffed99, transparent);
     --agent-nav-running-shine: light-dark(#422006, #ffe08a);
     --agent-nav-unread: light-dark(#15803d, #3ecf8e);
     --agent-nav-error: light-dark(#c1121f, #ff6166);
@@ -65,10 +64,12 @@
     cursor: pointer;
 }
 .agent-nav-agent:hover,
-.agent-nav-agent:focus-visible { background: var(--l1); }
+.agent-nav-agent:focus-visible,
+.agent-nav-agent:active { background: transparent; }
 .agent-nav-agent.is-current,
 .agent-nav-agent.is-current:hover,
-.agent-nav-agent:active { background: var(--l2); }
+.agent-nav-agent.is-current:focus-visible,
+.agent-nav-agent.is-current:active { background: rgba(128, 128, 128, 0.08); }
 .agent-nav-agent:focus-visible { outline: 1px solid var(--l4); outline-offset: -1px; }
 
 .agent-nav-title {
@@ -82,24 +83,13 @@
 /* Row states. */
 .agent-nav-agent.status-running {
     color: var(--agent-nav-running);
-    background: var(--agent-nav-running-bg);
-}
-.agent-nav-agent.status-running:hover,
-.agent-nav-agent.status-running:focus-visible {
-    background: light-dark(#ffe88a, var(--l1));
-}
-.agent-nav-agent.status-running.is-current,
-.agent-nav-agent.status-running.is-current:hover,
-.agent-nav-agent.status-running:active {
-    background: light-dark(#ffe373, var(--l2));
 }
 .agent-nav-agent.status-attention { color: var(--ansi5); }
 .agent-nav-agent.status-done-unread { color: var(--agent-nav-unread); }
 .agent-nav-agent.status-error { color: var(--agent-nav-error); font-weight: 600; }
 .agent-nav-agent.status-done-read { color: var(--t2); }
 
-/* Opaque text keeps its contrast throughout the native shimmer: a darker sweep
-   over the light yellow row in light mode, a brighter sweep in dark mode. */
+/* Keep text opaque throughout the native shimmer in both appearances. */
 .agent-nav-agent.status-running .agent-nav-title .sf-shimmer {
     --sh-lo: var(--agent-nav-running);
     --sh-mid: color-mix(in srgb, var(--agent-nav-running) 50%, var(--agent-nav-running-shine));

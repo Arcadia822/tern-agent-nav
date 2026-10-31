@@ -9,7 +9,7 @@ drives; line numbers cited are from that working tree.
 |---|---|---|
 | 01 | [nav-rows-session-titles.md](01-nav-rows-session-titles.md) | omp/codex/copilot session title 更新进导航行 |
 | 02 | [running-shimmer.md](02-running-shimmer.md) | running 只让文字 shimmer（光影在文字上，非背景/字形位移动画） |
-| 03 | [status-colors-theme.md](03-status-colors-theme.md) | 黄/绿/红保持语义色；浅色 running 亮黄底深色字；错误红加粗；明暗模式均可辨识 |
+| 03 | [status-colors-theme.md](03-status-colors-theme.md) | 状态只改变文字颜色与 shimmer；聚焦行固定淡灰底、其余透明；错误红加粗 |
 | 04 | [harness-logo.md](04-harness-logo.md) | harness logo 尺寸/裁切/对齐/明暗切换 |
 | 05 | [session-name-style.md](05-session-name-style.md) | Tern session 名非全大写且比 agent 标题更淡 |
 | 06 | [toggle-preset-width.md](06-toggle-preset-width.md) | 打开使用记忆宽度；多 block 跨 tick 重建不污染 share；拖拽与 Reset Width 正常 |
