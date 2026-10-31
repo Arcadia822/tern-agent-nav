@@ -4,19 +4,23 @@
 --
 -- Placement follows Overseer's Projects panel pattern: Tern panes belong to one tab,
 -- so the window keeps a single canvas and moves it into whichever tab is shown.
--- cx.layout:move only splits beside a leaf, so the destination's content is
--- rebuilt around the rail (one move per split, original ratios restored) until
--- the rail is the root split's outer child.
+-- The rail can only reach the tab's edge while the other side is a single pane, and
+-- cx.layout:resize only moves the nearest divider of the requested axis, so a
+-- placement is one bounded, journalled rebuild: park the content (every program
+-- keeps running and no pane is closed), put the rail on its edge at the
+-- remembered share, then re-grow the saved tree node by node, fitting each
+-- divider while its two children are still leaves.
 
 local ui = tern.ui
 
 local TITLE = "Agent Navigations"
 local ABOUT = "Agents across Tern sessions. Click a row to switch to its session and focus it."
 local TICK_MS = 750
+-- A restore that is still moving panes continues on this shorter cadence instead
+-- of waiting for the next normal tick; one follow-up is outstanding at a time.
+local FAST_TICK_MS = 60
 local DEFAULT_SHARE = 0.2
 local MIN_SHARE, MAX_SHARE = 0.08, 0.6
--- First guess of a tab's width in cells; each resize then corrects by what it moved.
-local CELLS_GUESS = 180
 
 local KV_ENABLED = "agent_nav.enabled"
 local KV_SIDE = "agent_nav.side"
@@ -99,53 +103,269 @@ local function storedShare(): number
 end
 
 --------------------------------------------------------------------------------
--- Split Tree Helpers (cx.session:layout(tab).root)
+-- Arrangement Model
 --------------------------------------------------------------------------------
+-- cx.session:layout(tab).root is a TabTree whose children are numeric [1]/[2]
+-- keys, and tern.json.decode drops null members and loses order, so a TabTree
+-- cannot be round-tripped through the journal. Everything this module stores,
+-- compares or replans therefore uses one shape: a `pane` leaf, or a split with
+-- named `axis`, `ratio`, `first` and `second`. Ratios live in the tree, so the
+-- model is exactly what a rebuild has to put back: pane ids, programs and titles
+-- are never touched, and no pane is ever closed to finish a restore.
 
-local function firstLeaf(t: any): number
-	if t.pane then
-		return t.pane
-	end
-	return firstLeaf(t[1])
-end
+type Axis = "right" | "down"
+type Tree = {
+	pane: number?,
+	axis: Axis?,
+	ratio: number?,
+	first: Tree?,
+	second: Tree?,
+}
 
--- Return the tree without `pane`; its parent split collapses into the sibling.
-local function strip(t: any, pane: number): any?
-	if not t then
+local MAX_TREE_DEPTH = 32
+local MAX_TREE_LEAVES = 64
+
+-- Strip `pane` from the raw native node tree before converting to Tree, so that
+-- valid depth-32 content does not become depth-33 when wrapped by a rail split.
+local function strip_native_pane(node: any, pane: number): any?
+	if type(node) ~= "table" then
 		return nil
 	end
-	if t.pane then
-		return if t.pane == pane then nil else t
+	if node.pane == pane then
+		return nil
 	end
-	local a, b = strip(t[1], pane), strip(t[2], pane)
+	if node.pane ~= nil then
+		return node
+	end
+	local split = node.split
+	if split ~= "right" and split ~= "down" then
+		return nil
+	end
+	local child1 = strip_native_pane(node[1], pane)
+	local child2 = strip_native_pane(node[2], pane)
+	if not child1 then
+		return child2
+	end
+	if not child2 then
+		return child1
+	end
+	return { split = split, ratio = node.ratio, [1] = child1, [2] = child2 }
+end
+
+-- Normalize a native TabTree; bounds match decoder exactly (depth 32, leaves 64, unique panes).
+local function tree_of(node: any, depth: number?, budget: { number }?, seen: { [number]: boolean }?): Tree?
+	local d = depth or 0
+	local left = budget or { MAX_TREE_LEAVES }
+	local panes = seen or {}
+	if type(node) ~= "table" or d > MAX_TREE_DEPTH then
+		return nil
+	end
+	local pane = node.pane
+	if type(pane) == "number" then
+		if pane <= 0 or pane ~= math.floor(pane) or left[1] <= 0 or panes[pane] then
+			return nil
+		end
+		left[1] -= 1
+		panes[pane] = true
+		return { pane = pane }
+	end
+	local axis = node.split
+	if axis ~= "right" and axis ~= "down" then
+		return nil
+	end
+	local split: Axis = axis
+	local first = tree_of(node[1], d + 1, left, panes)
+	local second = tree_of(node[2], d + 1, left, panes)
+	if not first or not second then
+		return nil
+	end
+	local ratio = node.ratio
+	return {
+		axis = split,
+		ratio = if type(ratio) == "number" and ratio > 0 and ratio < 1 then ratio else 0.5,
+		first = first,
+		second = second,
+	}
+end
+
+-- Pane ids of a tree, in native order. Never silently truncates membership.
+local function leaves_of(t: Tree, out: { number }?): { number }
+	local acc = out or {}
+	local pane = t.pane
+	if pane then
+		table.insert(acc, pane)
+		return acc
+	end
+	local first, second = t.first, t.second
+	if first then
+		leaves_of(first, acc)
+	end
+	if second then
+		leaves_of(second, acc)
+	end
+	return acc
+end
+
+local function first_leaf(t: Tree): number?
+	local pane = t.pane
+	if pane then
+		return pane
+	end
+	local first = t.first
+	return if first then first_leaf(first) else nil
+end
+
+local function has_pane(t: Tree, pane: number): boolean
+	local own = t.pane
+	if own then
+		return own == pane
+	end
+	local first, second = t.first, t.second
+	return (first ~= nil and has_pane(first, pane)) or (second ~= nil and has_pane(second, pane))
+end
+
+-- The tree without `pane`, its parent split collapsed into the sibling; nil when
+-- the tree held nothing else.
+local function strip_pane(t: Tree, pane: number): Tree?
+	local own = t.pane
+	if own then
+		return if own == pane then nil else t
+	end
+	local axis, ratio, first, second = t.axis, t.ratio, t.first, t.second
+	if not axis or not first or not second then
+		return nil
+	end
+	local a, b = strip_pane(first, pane), strip_pane(second, pane)
 	if not a then
 		return b
 	end
 	if not b then
 		return a
 	end
-	return { split = t.split, ratio = t.ratio, [1] = a, [2] = b }
+	return { axis = axis, ratio = ratio or 0.5, first = a, second = b }
 end
 
--- Find the leaf of `t` touching its far edge toward `dir`.
-local function edgeLeaf(t: any, dir: string): number
-	if t.pane then
-		return t.pane
+-- Same leaves in the same positions on the same axes; ratios excluded.
+local function same_shape(a: Tree, b: Tree): boolean
+	local pa, pb = a.pane, b.pane
+	if pa or pb then
+		return pa == pb
 	end
-	return edgeLeaf(if t.split == dir then t[2] else t[1], dir)
+	if a.axis ~= b.axis then
+		return false
+	end
+	local af, bf, as, bs = a.first, b.first, a.second, b.second
+	if not af or not bf or not as or not bs then
+		return false
+	end
+	return same_shape(af, bf) and same_shape(as, bs)
 end
 
-local function nodeAt(t: any, path: { number }): any?
-	for _, i in path do
-		if not t or t.pane then
+
+-- The split that owns `pane` as a direct child, read from the live native tree
+-- so a fit knows which divider cx.layout:resize will move: its axis, its ratio
+-- and which side of it the pane sits on.
+local function parent_of(node: any, pane: number, depth: number?): (Axis?, number?, boolean?)
+	local d = depth or 0
+	if type(node) ~= "table" or d > MAX_TREE_DEPTH + 1 or node.pane ~= nil then
+		return nil, nil, false
+	end
+	for i = 1, 2 do
+		local child = node[i]
+		if type(child) == "table" and child.pane == pane then
+			local axis = node.split
+			if axis ~= "right" and axis ~= "down" then
+				return nil, nil, false
+			end
+			local split: Axis = axis
+			local ratio = node.ratio
+			return split, (if type(ratio) == "number" then ratio else 0.5), i == 1
+		end
+	end
+	for i = 1, 2 do
+		local split, ratio, first = parent_of(node[i], pane, d + 1)
+		if split then
+			return split, ratio, first
+		end
+	end
+	return nil, nil, false
+end
+
+-- Locate the split owning a direct-child pair (a, b) in the native tree.
+local function split_of_pair(node: any, a: number, b: number, depth: number?): (Axis?, number?, boolean?)
+	local d = depth or 0
+	if type(node) ~= "table" or d > MAX_TREE_DEPTH + 1 or node.pane ~= nil then
+		return nil, nil, false
+	end
+	local axis = node.split
+	if axis == "right" or axis == "down" then
+		local c1, c2 = node[1], node[2]
+		if type(c1) == "table" and type(c2) == "table" then
+			local split: Axis = axis
+			local ratio = if type(node.ratio) == "number" then node.ratio else 0.5
+			if c1.pane == a and c2.pane == b then
+				return split, ratio, true
+			elseif c1.pane == b and c2.pane == a then
+				return split, ratio, false
+			end
+		end
+	end
+	for i = 1, 2 do
+		local s, r, first = split_of_pair(node[i], a, b, d + 1)
+		if s then
+			return s, r, first
+		end
+	end
+	return nil, nil, false
+end
+
+local function tree_json(t: Tree): any
+	local pane = t.pane
+	if pane then
+		return { pane = pane }
+	end
+	local first, second = t.first, t.second
+	if not first or not second then
+		return nil
+	end
+	return { axis = t.axis, ratio = t.ratio, first = tree_json(first), second = tree_json(second) }
+end
+
+-- Validate a stored tree: ids, axes and ratios only, bounded in depth and size.
+local function tree_from(value: any, depth: number?, budget: { number }?, seen: { [number]: boolean }?): Tree?
+	local d = depth or 0
+	local left = budget or { MAX_TREE_LEAVES }
+	local panes = seen or {}
+	if type(value) ~= "table" or d > MAX_TREE_DEPTH then
+		return nil
+	end
+	local pane = value.pane
+	if type(pane) == "number" then
+		if pane <= 0 or pane ~= math.floor(pane) or left[1] <= 0 or panes[pane] then
 			return nil
 		end
-		t = t[i]
+		left[1] -= 1
+		panes[pane] = true
+		return { pane = pane }
 	end
-	return t
+	local axis = value.axis
+	if axis ~= "right" and axis ~= "down" then
+		return nil
+	end
+	local split: Axis = axis
+	local ratio = value.ratio
+	if type(ratio) ~= "number" or not (ratio > 0 and ratio < 1) then
+		return nil
+	end
+	local first = tree_from(value.first, d + 1, left, panes)
+	local second = tree_from(value.second, d + 1, left, panes)
+	if not first or not second then
+		return nil
+	end
+	return { axis = split, ratio = ratio, first = first, second = second }
 end
 
--- Return the rail's share of the tab when it is the root split's outer child on `s`.
+-- The rail's share of the tab when it is the root split's outer child on `s`.
 local function railShare(root: any, pane: number, s: Side): number?
 	if not root or root.split ~= "right" then
 		return nil
@@ -160,88 +380,1399 @@ local function railShare(root: any, pane: number, s: Side): number?
 	return nil
 end
 
-type Op = { pane: number, target: number, dir: Dir }
-type Fit = { path: { number }, ratio: number, edge: number, dir: Dir }
-
--- Compute moves to leave `content` intact with the rail as the root's `s` child.
-local function rebuild(content: any, rail: number, s: Side): ({ Op }, { Fit })
-	local ops: { Op } = { { pane = rail, target = firstLeaf(content), dir = s } }
-	local fits: { Fit } = {}
-	local path: { number } = {}
-	local function walk(node: any)
-		if node.pane then
-			return
-		end
-		local dir: Dir = if node.split == "down" then "down" else "right"
-		table.insert(ops, { pane = firstLeaf(node[2]), target = firstLeaf(node[1]), dir = dir })
-		table.insert(fits, { path = table.clone(path), ratio = node.ratio or 0.5, edge = edgeLeaf(node[1], dir), dir = dir })
-		for i = 1, 2 do
-			table.insert(path, i)
-			walk(node[i])
-			table.remove(path)
-		end
+-- Grow `pane` toward `axis` to grow the side of it that holds the first child.
+local function toward(axis: Axis, first: boolean): Dir
+	if axis == "right" then
+		return if first then "right" else "left"
 	end
-	walk(content)
-	return ops, fits
+	return if first then "down" else "up"
 end
 
--- Resize iteratively toward target ratio using observed step corrections.
-local function steer(read: () -> number?, push: (cells: number) -> boolean, want: number)
-	local r = read()
-	if not r then
-		return
-	end
-	local step = math.floor((want - r) * CELLS_GUESS + 0.5)
-	for _ = 1, 8 do
-		if math.abs(r - want) < 0.004 or step == 0 then
-			return
-		end
-		if not push(step) then
-			return
-		end
-		local after = read()
-		if not after or after == r then
-			return
-		end
-		step = math.floor((want - after) * step / (after - r) + 0.5)
-		r = after
-	end
+local function away(axis: Axis): Dir
+	return if axis == "right" then "left" else "up"
 end
 
 --------------------------------------------------------------------------------
--- The Panel & State Tracking
+-- Panel & Layout State
 --------------------------------------------------------------------------------
 
 local slotPane: number? = nil
-local panelTab: number? = nil
-local placedSide: Side? = nil
+local lastRailTab: number? = nil
 -- The rail's width as this plugin last measured or set it, and the tab that
 -- width belongs to: `appliedShare` says nothing about any other tab, so a
--- pending rework must not be mistaken for the user dragging the divider.
+-- pending rework must never be mistaken for the user dragging the divider.
 local appliedShare: number? = nil
 local appliedTab: number? = nil
 local share = storedShare()
-local busy = false
 local warnedIds = false
--- A tab switch rebuilds the destination around the rail, which leaves the rail
--- at the split default until it is sized and its content ratios are restored;
--- that work is spread across ticks because a full rebuild with 8-step steering
--- per split inside one hook overran Tern's plugin hook budget, after which Tern
--- pauses the hook and the panel freezes on stale state.
-local pendingFits: { Fit } = {}
-local pendingSize = false
-local pendingTab: number? = nil
+
+type PendingFit = {
+	mover: number,
+	anchor: number,
+	axis: Axis,
+	ratio: number,
+	owner: number,
+}
+
+-- The rebuild in flight: the tab being put back, the arrangement to restore and
+-- the panes this job parked to do it. It outlives reloads through the journal,
+-- and it is the only owner of the native layout while it runs.
+type Job = {
+	seq: number,
+	tab: number,
+	session: number,
+	side: Side,
+	share: number,
+	stage: string,
+	anchor: number,
+	content: Tree?,
+	members: { [number]: boolean },
+	owned: { [number]: boolean },
+	focus: number?,
+	name: string?,
+	dest: number?,
+	pending: PendingFit?,
+	warned: { [string]: boolean },
+	stuck: { [number]: number },
+}
+
+local function set_stage(job: Job, nextStage: string)
+	job.stage = nextStage
+	if nextStage ~= "grow" then
+		job.pending = nil
+	end
+end
+
+local state = {
+	job = nil :: Job?,
+	advancing = false,
+	resumed = false,
+	windowKey = nil :: string?,
+	keyReady = false,
+	clamped = nil :: { tab: number, side: Side, share: number, tries: number }?,
+	journalWarned = false,
+	windowSeq = 0,
+}
+
+local function is_parked(cx: WindowCx, pane: number): boolean
+	local info = cx.session:pane(pane)
+	return info ~= nil and info.parked == true
+end
+
+local function owned_list(owned: { [number]: boolean }): { number }
+	local out: { number } = {}
+	for pane in owned do
+		table.insert(out, pane)
+	end
+	table.sort(out)
+	return out
+end
+
+
+local function pending_json(p: PendingFit?): any?
+	if not p then
+		return nil
+	end
+	return {
+		mover = p.mover,
+		anchor = p.anchor,
+		axis = p.axis,
+		ratio = p.ratio,
+		owner = p.owner,
+	}
+end
+
+local function valid_id(value: any): boolean
+	return type(value) == "number" and value > 0 and value < math.huge and value == math.floor(value)
+end
+
+local function pending_from(doc: any): PendingFit?
+	local p = doc.pending
+	if type(p) ~= "table" then
+		return nil
+	end
+	local mover, anchor, owner, ratio = tonumber(p.mover), tonumber(p.anchor), tonumber(p.owner), tonumber(p.ratio)
+	if not mover or not anchor or mover <= 0 or anchor <= 0 or mover >= math.huge or anchor >= math.huge
+		or mover ~= math.floor(mover) or anchor ~= math.floor(anchor) or mover == anchor
+		or (owner ~= mover and owner ~= anchor) or not ratio or not (ratio > 0 and ratio < 1) then
+		return nil
+	end
+	if p.axis ~= "right" and p.axis ~= "down" then
+		return nil
+	end
+	return { mover = mover, anchor = anchor, axis = p.axis, ratio = ratio, owner = owner }
+end
+
+--------------------------------------------------------------------------------
+-- Durable Rebuild Journal
+--------------------------------------------------------------------------------
+-- A rebuild spans hooks, and pane ids live in the window VM, so a reload, a
+-- paused hook or a closed window would strand the panes it parked out of their
+-- tab. The job is written before the first pane is parked into one file per
+-- window with two alternating slots: an interrupted write costs the newest
+-- checkpoint but never the last valid one. tern.kv is shared by every window and
+-- its cross-VM read-modify-write is not documented as atomic, so the journal is
+-- not kept there.
+
+local JOURNAL_VERSION = 1
+local JOURNAL_MAX_BYTES = 256 * 1024
+local LAYOUT_STAGES: { [string]: boolean } = {
+	attach = true, clear = true, rail = true, grow = true, verify = true, release = true,
+}
+
+local function hex_of(text: string): string
+	return (string.gsub(text, ".", function(c: string): string
+		return string.format("%02x", string.byte(c))
+	end))
+end
+
+local function journal_dir(): string?
+	local data = tern.plugin.data
+	if type(data) ~= "string" or data == "" then
+		return nil
+	end
+	return data .. "/layout"
+end
+
+-- One window key, one file stem: the key is hex-encoded, so any byte string,
+-- including the empty first-window key, maps to exactly one file name.
+local function journal_path(key: string, seq: number): string?
+	local dir = journal_dir()
+	if not dir then
+		return nil
+	end
+	return dir .. "/window-" .. hex_of(key) .. (if seq % 2 == 0 then ".a.json" else ".b.json")
+end
+
+local function window_key(cx: WindowCx): string?
+	if not state.keyReady then
+		state.keyReady = true
+		state.windowKey = cx:window_key()
+	end
+	return state.windowKey
+end
+
+local function read_slot(path: string): any?
+	local ok, text = pcall(tern.fs.read, path, JOURNAL_MAX_BYTES)
+	if not ok or type(text) ~= "string" then
+		return nil
+	end
+	local okDecode, doc = pcall(tern.json.decode, text)
+	return if okDecode and type(doc) == "table" then doc else nil
+end
+
+local function write_slot(path: string, doc: any): boolean
+	local dir = journal_dir()
+	if not dir then
+		return false
+	end
+	local ok, err = pcall(function()
+		if not tern.fs.exists(dir) then
+			tern.fs.mkdir(dir)
+		end
+		local encoded = tern.json.encode(doc)
+		if #encoded > JOURNAL_MAX_BYTES then
+			error("journal doc exceeds maximum bytes")
+		end
+		tern.fs.write(path, encoded)
+	end)
+	if not ok then
+		if not state.journalWarned then
+			state.journalWarned = true
+			tern.log.warn("Agent Nav: cannot write the layout journal under " .. dir ..
+				"; a reload in the middle of a restore will not resume it: " .. tostring(err))
+		end
+		return false
+	end
+	return true
+end
+
+-- The job as it goes on disk; the tree keeps named members so it decodes back
+-- into the shape it was written from.
+local function job_json(job: Job, key: string): any?
+	local content: any = nil
+	if job.content then
+		content = tree_json(job.content)
+		if not content then
+			return nil
+		end
+	end
+	return {
+		v = JOURNAL_VERSION,
+		key = key,
+		seq = job.seq,
+		tab = job.tab,
+		session = job.session,
+		side = job.side,
+		share = job.share,
+		stage = job.stage,
+		anchor = job.anchor,
+		content = content,
+		members = owned_list(job.members),
+		owned = owned_list(job.owned),
+		focus = job.focus,
+		name = job.name,
+		dest = job.dest,
+		pending = pending_json(job.pending),
+	}
+end
+
+-- A stored record becomes a job only when every field this module acts on is
+-- present and sane; anything else is dropped at the boundary.
+local function job_from(doc: any): Job?
+	if type(doc) ~= "table" or doc.v ~= JOURNAL_VERSION or doc.done == true then
+		return nil
+	end
+	local tab, session, anchor, wantShare = tonumber(doc.tab), tonumber(doc.session), tonumber(doc.anchor), tonumber(doc.share)
+	local side = doc.side
+	local stage = doc.stage
+	if not valid_id(tab) or not valid_id(session) or not valid_id(anchor) or not valid_id(doc.seq) or not wantShare then
+		return nil
+	end
+	if side ~= "left" and side ~= "right" then
+		return nil
+	end
+	if not (wantShare > 0 and wantShare < 1) then
+		return nil
+	end
+	if type(stage) ~= "string" or not LAYOUT_STAGES[stage] then
+		return nil
+	end
+	local content: Tree? = nil
+	if doc.content ~= nil then
+		content = tree_from(doc.content)
+		if not content then
+			return nil
+		end
+	end
+
+	if type(doc.members) ~= "table" or #doc.members == 0 or #doc.members > MAX_TREE_LEAVES or type(doc.owned) ~= "table" then
+		return nil
+	end
+	local members: { [number]: boolean } = {}
+	for _, pane in doc.members do
+		if not valid_id(pane) or members[pane] then
+			return nil
+		end
+		members[pane] = true
+	end
+	if not members[anchor] then
+		return nil
+	end
+	if content then
+		for _, pane in leaves_of(content) do
+			if not members[pane] then
+				return nil
+			end
+		end
+	end
+	local owned: { [number]: boolean } = {}
+	for _, pane in doc.owned do
+		if not valid_id(pane) or not members[pane] or owned[pane] then
+			return nil
+		end
+		owned[pane] = true
+	end
+	for _, name in { "focus", "dest" } do
+		local pane = doc[name]
+		if pane ~= nil and (not valid_id(pane) or not members[pane]) then
+			return nil
+		end
+	end
+	local pending = pending_from(doc)
+	if doc.pending ~= nil and (not pending or not members[pending.mover] or not members[pending.anchor]) then
+		return nil
+	end
+
+	return {
+		seq = tonumber(doc.seq) or 0,
+		tab = tab,
+		session = session,
+		side = side,
+		share = wantShare,
+		stage = stage,
+		anchor = anchor,
+		content = content,
+		members = members,
+		owned = owned,
+		focus = tonumber(doc.focus),
+		name = if type(doc.name) == "string" and doc.name ~= "" then doc.name else nil,
+		dest = tonumber(doc.dest),
+		pending = pending,
+		warned = {},
+		stuck = {},
+	}
+end
+
+-- Persist job checkpoint; advances sequence and slot only on success.
+-- Keeps previous valid slot intact on repeated failures.
+local function persist(job: Job): boolean
+	local key = state.windowKey
+	if not key then
+		return false
+	end
+	local nextSeq = math.max(state.windowSeq, job.seq) + 1
+	local doc = job_json(job, key)
+	if not doc then
+		return false
+	end
+	doc.seq = nextSeq
+	local path = journal_path(key, nextSeq)
+	if not path then
+		return false
+	end
+	local ok = write_slot(path, doc)
+	if not ok then
+		return false
+	end
+	job.seq = nextSeq
+	state.windowSeq = nextSeq
+	return true
+end
+
+local function retire_journal(seq: number): boolean
+	local key = state.windowKey
+	if not key then
+		return false
+	end
+	local nextSeq = math.max(state.windowSeq, seq) + 1
+	local path = journal_path(key, nextSeq)
+	if not path then
+		return false
+	end
+	local ok = write_slot(path, { v = JOURNAL_VERSION, key = key, seq = nextSeq, done = true })
+	if ok then
+		state.windowSeq = nextSeq
+	end
+	return ok
+end
+
+-- A completed checkpoint wins even if the user subsequently parks one of its
+-- former members. Old ownership must never be resurrected from another slot.
+local function journal_load(key: string): any?
+	local best: any = nil
+	for slotIndex = 0, 1 do
+		local path = journal_path(key, slotIndex)
+		local doc = if path then read_slot(path) else nil
+		local seq = if doc then doc.seq else nil
+		if doc and doc.v == JOURNAL_VERSION and doc.key == key and valid_id(seq)
+			and seq < 9007199254740991 and seq % 2 == slotIndex
+			and (doc.done == true or job_from(doc) ~= nil) then
+			if not best or seq > best.seq then
+				best = doc
+			end
+		end
+	end
+	if best then
+		state.windowSeq = math.max(state.windowSeq, best.seq)
+	end
+	return if best and best.done ~= true then best else nil
+end
+
+
+local function noteDrag(cx: WindowCx, tab: number, rail: number)
+	if state.job or not appliedShare or appliedTab ~= tab then
+		return
+	end
+	local layout = cx.session:layout(tab)
+	if not layout or not layout.root or layout.root.split ~= "right" then
+		return
+	end
+	local root = layout.root
+	local current: number? = nil
+	if root[1] and root[1].pane == rail then
+		current = root.ratio or 0.5
+	elseif root[2] and root[2].pane == rail then
+		current = 1 - (root.ratio or 0.5)
+	end
+	if not current then
+		return
+	end
+	if math.abs(current - appliedShare) > 0.005 then
+		share = clampShare(current)
+		appliedShare = current
+		tern.kv.set(KV_SHARE, share)
+	end
+end
+
+
+local SHARE_TOL = 0.01
+local RATIO_TOL = 1e-6
+local MAX_PUSHES = 4
+local MAX_STEPS = 4
+local ADVANCE_MS = 40
+
+local function tab_info(cx: WindowCx, tab: number): TabInfo?
+	for _, info in cx.session:tabs() do
+		if info.id == tab then
+			return info
+		end
+	end
+	return nil
+end
+
+local function session_of(cx: WindowCx, tab: number): number?
+	local info = tab_info(cx, tab)
+	return if info then info.session else nil
+end
+
+local function content_of(cx: WindowCx, tab: number, rail: number?): Tree?
+	local layout = cx.session:layout(tab)
+	if not layout or not layout.root then
+		return nil
+	end
+	local nativeRoot = layout.root
+	if rail then
+		nativeRoot = strip_native_pane(nativeRoot, rail)
+		if not nativeRoot then
+			return nil
+		end
+	end
+	return tree_of(nativeRoot)
+end
+
+local function adopt_destination(cx: WindowCx, job: Job, rail: number?): boolean
+	local dest = job.dest
+	if not dest or cx.session:layout(job.tab) then
+		return false
+	end
+	local tab = cx.session:tab_of(dest)
+	if not tab then
+		return false
+	end
+	local info = tab_info(cx, tab)
+	local content = content_of(cx, tab, rail)
+	local eligible = info ~= nil and info.session == job.session and content ~= nil
+	if content then
+		for _, pane in leaves_of(content) do
+			if not job.members[pane] then
+				eligible = false
+				break
+			end
+		end
+	end
+	if not eligible then
+		job.dest = nil
+		persist(job)
+		return false
+	end
+	job.tab, job.anchor = tab, dest
+	job.owned[dest] = nil
+	set_stage(job, "clear")
+	persist(job)
+	return true
+end
+
+
+local function parked_owned(cx: WindowCx, job: Job): { number }
+	local out: { number } = {}
+	for pane in job.owned do
+		if is_parked(cx, pane) then
+			table.insert(out, pane)
+		end
+	end
+	table.sort(out)
+	return out
+end
+
+local function choose_anchor(cx: WindowCx, tab: number, content: Tree?, rail: number?): number?
+	if not content then
+		return nil
+	end
+	local focused = cx.session:focused()
+	if focused and focused ~= rail and has_pane(content, focused) and cx.session:tab_of(focused) == tab then
+		return focused
+	end
+	for _, pane in leaves_of(content) do
+		if pane ~= rail and cx.session:tab_of(pane) == tab then
+			return pane
+		end
+	end
+	for _, pane in leaves_of(content) do
+		if pane ~= rail and cx.session:pane(pane) then
+			return pane
+		end
+	end
+	return nil
+end
+
+local function warn_once(job: Job, kind: string, message: string)
+	if job.warned[kind] then
+		return
+	end
+	job.warned[kind] = true
+	tern.log.warn(message)
+end
+
+local function complete(job: Job, reason: string)
+	if state.job ~= job then
+		return
+	end
+	local hasDebt = false
+	for pane in job.owned do
+		hasDebt = true
+		break
+	end
+	if hasDebt then
+		set_stage(job, "release")
+		persist(job)
+		return
+	end
+	state.job = nil
+	retire_journal(job.seq)
+	tern.log.debug("Agent Nav: layout job finished (" .. reason .. ")")
+end
+
+local function release_job(job: Job, why: string): string
+	if not job.warned.release then
+		job.warned.release = true
+		tern.log.warn("Agent Nav: abandoning the saved layout (" .. why .. "); returning every pane it parked")
+	end
+	job.content = nil
+	set_stage(job, "release")
+	persist(job)
+	return "again"
+end
+
+local function empty_job(job: Job): string
+	job.content = nil
+	set_stage(job, "release")
+	persist(job)
+	return "again"
+end
+
+local function remember_clamp(job: Job)
+	local memo = state.clamped
+	if memo and memo.tab == job.tab and memo.side == job.side and math.abs(memo.share - job.share) < 1e-9 then
+		memo.tries += 1
+		return
+	end
+	state.clamped = { tab = job.tab, side = job.side, share = job.share, tries = 1 }
+end
+
+local function is_clamped(tab: number, s: Side, want: number): boolean
+	local memo = state.clamped
+	return memo ~= nil and memo.tab == tab and memo.side == s and math.abs(memo.share - want) < 1e-9
+end
+
+local function fit_share(cx: WindowCx, tab: number, owner: number, axis: Axis, want: number, peer: number?): (string, number, number?)
+	local function read_ratio(): (number?, boolean?)
+		local layout = cx.session:layout(tab)
+		if not layout then
+			return nil, nil
+		end
+		local foundAxis, ratio, first
+		if peer then
+			foundAxis, ratio, first = split_of_pair(layout.root, owner, peer)
+		else
+			foundAxis, ratio, first = parent_of(layout.root, owner)
+		end
+		if foundAxis ~= axis or not ratio then
+			return nil, nil
+		end
+		return if first then ratio else 1 - ratio, first
+	end
+	local current, first = read_ratio()
+	if not current then
+		return "lost", 0, nil
+	end
+	if math.abs(want - current) <= RATIO_TOL then
+		return "ok", 0, current
+	end
+	local dir: Dir = if first then axis else away(axis)
+	local cells = if want > current then 1 else -1
+	local unit: number? = nil
+	local pushes = 0
+	for attempt = 1, MAX_PUSHES do
+		local before = current
+		local moved = cx.layout:resize(owner, dir, cells)
+		local after, afterFirst = read_ratio()
+		if not after or afterFirst ~= first then
+			return "lost", pushes, nil
+		end
+		current = after
+		if not moved or math.abs(current - before) <= 1e-12 then
+			if unit then
+				return if math.abs(want - current) <= RATIO_TOL then "ok" else "clamped", pushes, current
+			end
+			-- Probe away from a native bound before continuing the fit.
+			if attempt > 1 then
+				return "clamped", pushes, current
+			end
+			cells = -cells
+		else
+			pushes += 1
+			unit = math.abs((current - before) / cells)
+			local delta = want - current
+			if math.abs(delta) <= RATIO_TOL then
+				return "ok", pushes, current
+			end
+			cells = delta / unit
+		end
+	end
+	return "again", pushes, current
+end
+
+local function place_pane(cx: WindowCx, job: Job, mover: number, anchor: number, dir: Dir): string
+	if cx.session:tab_of(anchor) ~= job.tab then
+		return "retarget"
+	end
+	if cx.session:tab_of(mover) ~= job.tab then
+		local info = cx.session:pane(mover)
+		if not info or info.parked ~= true or job.owned[mover] ~= true then
+			return "retarget"
+		end
+		local ok, err = cx.layout:move_to_tab(mover, job.tab, { focus = false })
+		if not ok then
+			warn_once(job, "admit", "Agent Nav: could not bring a parked pane back into its tab: " .. tostring(err))
+			return "wait"
+		end
+		job.owned[mover] = nil
+		persist(job)
+	end
+	local layout = cx.session:layout(job.tab)
+	if layout then
+		local axis, _, first = split_of_pair(layout.root, mover, anchor)
+		local horizontal = dir == "left" or dir == "right"
+		if axis == (if horizontal then "right" else "down") and first == (dir == "left" or dir == "up") then
+			return "ok"
+		end
+	end
+	if cx.layout:move(mover, anchor, dir, { focus = false }) then
+		return "ok"
+	end
+	job.stuck[mover] = (job.stuck[mover] or 0) + 1
+	job.owned[mover] = true
+	if not persist(job) then
+		job.owned[mover] = nil
+		return "wait"
+	end
+	cx.layout:park(mover)
+	if job.stuck[mover] >= 3 then
+		return "retarget"
+	end
+	return "wait"
+end
+
+local function pending_step(cx: WindowCx, job: Job): string
+	local p = job.pending
+	if not p then
+		return "again"
+	end
+	if not job.content or not has_pane(job.content, p.mover) or not has_pane(job.content, p.anchor) then
+		job.pending = nil
+		persist(job)
+		return "again"
+	end
+	local layout = cx.session:layout(job.tab)
+	if not layout then
+		return "wait"
+	end
+	local peer = if p.owner == p.anchor then p.mover else p.anchor
+	local actualAxis, _, first = split_of_pair(layout.root, p.owner, peer)
+	if actualAxis ~= p.axis or not first then
+		local placed = place_pane(cx, job, p.mover, p.anchor, toward(p.axis, p.owner == p.anchor))
+		if placed == "retarget" then
+			return release_job(job, "the pending placement changed outside this restore")
+		end
+		return if placed == "ok" then "acted" else "wait"
+	end
+	local status, pushes = fit_share(cx, job.tab, p.owner, p.axis, p.ratio, peer)
+	if status == "lost" then
+		return release_job(job, "the pending divider no longer exists")
+	end
+	if status == "again" then
+		return "acted"
+	end
+	if status == "clamped" then
+		warn_once(job, "fit:" .. tostring(p.owner), "Agent Nav: native pane size limits prevent the saved content ratio")
+	end
+	job.pending = nil
+	if not persist(job) then
+		job.pending = p
+		return "wait"
+	end
+	return if pushes > 0 then "acted" else "again"
+end
+
+local function grow_walk(cx: WindowCx, job: Job, live: Tree, want: Tree): string
+	local wantPane, livePane = want.pane, live.pane
+	if wantPane then
+		return if livePane == wantPane then "done" else "retarget"
+	end
+	local axis, first, second = want.axis, want.first, want.second
+	if not axis or not first or not second then
+		return "retarget"
+	end
+	if livePane then
+		local inFirst = has_pane(first, livePane)
+		if not inFirst and not has_pane(second, livePane) then
+			return "retarget"
+		end
+		local mover = first_leaf(if inFirst then second else first)
+		if not mover then
+			return "retarget"
+		end
+		job.pending = {
+			mover = mover,
+			anchor = livePane,
+			axis = axis,
+			ratio = want.ratio or 0.5,
+			owner = if inFirst then livePane else mover,
+		}
+		if not persist(job) then
+			job.pending = nil
+			return "wait"
+		end
+		return "again"
+	end
+	local liveFirst, liveSecond = live.first, live.second
+	if live.axis ~= axis or not liveFirst or not liveSecond then
+		return "retarget"
+	end
+	local result = grow_walk(cx, job, liveFirst, first)
+	if result ~= "done" then
+		return result
+	end
+	return grow_walk(cx, job, liveSecond, second)
+end
+
+local function gone(cx: WindowCx, job: Job, rail: number?): string
+	local parked = parked_owned(cx, job)
+	if #parked == 0 then
+		complete(job, "tab closed")
+		return "again"
+	end
+	if adopt_destination(cx, job, rail) then
+		return "again"
+	end
+	local pane = parked[1]
+	local info = cx.session:pane(pane)
+	local session = if info then info.session else job.session
+
+	job.dest = pane
+	if not persist(job) then
+		job.dest = nil
+		return "wait"
+	end
+
+	local tab, err = cx.layout:move_to_new_tab(pane, session, { focus = false })
+	if not tab then
+		job.dest = nil
+		persist(job)
+		warn_once(job, "recover", "Agent Nav: could not open a tab to recover parked panes: " .. tostring(err))
+		return "wait"
+	end
+	job.tab = tab
+	job.anchor = pane
+	set_stage(job, "clear")
+	job.owned[pane] = nil
+	if job.name then
+		cx.layout:name_tab(tab, job.name)
+	end
+	persist(job)
+	return "acted"
+end
+
+local function release_step(cx: WindowCx, job: Job): string
+	local parked = parked_owned(cx, job)
+	if #parked == 0 then
+		complete(job, "released")
+		return "again"
+	end
+	local pane = parked[1]
+	local ok, err = cx.layout:move_to_tab(pane, job.tab, { focus = false })
+	if not ok then
+		warn_once(job, "release", "Agent Nav: could not return a parked pane to its tab: " .. tostring(err))
+		return "wait"
+	end
+	job.owned[pane] = nil
+	persist(job)
+	return "acted"
+end
+
+local function attach_step(cx: WindowCx, job: Job, rail: number?): string
+	if rail and cx.session:tab_of(rail) ~= job.tab then
+		local ok, err = cx.layout:move_to_tab(rail, job.tab, { focus = false })
+		if not ok then
+			job.stuck[rail] = (job.stuck[rail] or 0) + 1
+			if job.stuck[rail] >= 3 then
+				return release_job(job, "the panel could not be attached to its tab")
+			end
+			warn_once(job, "attach", "Agent Nav: could not attach the panel to its tab: " .. tostring(err))
+			return "wait"
+		end
+		lastRailTab = job.tab
+		return "acted"
+	end
+	if cx.session:tab_of(job.anchor) ~= job.tab then
+		local anchor = choose_anchor(cx, job.tab, job.content, rail)
+		if not anchor then
+			return empty_job(job)
+		end
+		job.anchor = anchor
+		if cx.session:tab_of(anchor) ~= job.tab then
+			if not cx.layout:move_to_tab(anchor, job.tab, { focus = false }) then
+				job.stuck[anchor] = (job.stuck[anchor] or 0) + 1
+				if job.stuck[anchor] >= 3 then
+					return release_job(job, "the pane the restore keeps in place could not be returned to its tab")
+				end
+				return "wait"
+			end
+			job.owned[anchor] = nil
+			persist(job)
+			return "acted"
+		end
+	end
+	set_stage(job, "clear")
+	persist(job)
+	return "again"
+end
+
+local function clear_step(cx: WindowCx, job: Job, rail: number?): string
+	local content = job.content
+	local live = content_of(cx, job.tab, rail)
+	if not content or not live then
+		return empty_job(job)
+	end
+	local focused = cx.session:focused()
+	if focused and has_pane(live, focused) and has_pane(content, focused) then
+		job.anchor, job.focus = focused, focused
+	end
+	local panes = leaves_of(live)
+	if #panes == 0 then
+		return empty_job(job)
+	end
+	if #panes == 1 then
+		local only = panes[1]
+		if only == job.anchor or has_pane(content, only) then
+			job.anchor = only
+			set_stage(job, "rail")
+			persist(job)
+			return "again"
+		end
+		return release_job(job, "the tab holds a pane this job never captured")
+	end
+	local victim: number? = nil
+	for _, pane in panes do
+		if pane ~= job.anchor then
+			victim = pane
+			break
+		end
+	end
+	if not victim then
+		return "wait"
+	end
+	if not has_pane(content, victim) then
+		return release_job(job, "the tab gained a pane while it was being restored")
+	end
+	job.owned[victim] = true
+	if not persist(job) then
+		job.owned[victim] = nil
+		warn_once(job, "park_persist", "Agent Nav: could not save ownership before parking; postponing park")
+		return "wait"
+	end
+	local ok, err = cx.layout:park(victim)
+	if not ok then
+		job.owned[victim] = nil
+		job.stuck[victim] = (job.stuck[victim] or 0) + 1
+		persist(job)
+		if job.stuck[victim] >= 3 then
+			return release_job(job, "a pane could not be parked without closing it")
+		end
+		warn_once(job, "park", "Agent Nav: could not park a pane before restoring: " .. tostring(err))
+		return "wait"
+	end
+	return "acted"
+end
+
+local function rail_step(cx: WindowCx, job: Job, rail: number?, layout: TabLayout): string
+	if not rail or cx.session:tab_of(rail) ~= job.tab then
+		set_stage(job, "grow")
+		persist(job)
+		return "again"
+	end
+	local current = railShare(layout.root, rail, job.side)
+	if not current then
+		local live = content_of(cx, job.tab, rail)
+		if not live then
+			return empty_job(job)
+		end
+		local panes = leaves_of(live)
+		if #panes ~= 1 then
+			set_stage(job, "clear")
+			return "again"
+		end
+		local target = panes[1]
+		job.anchor = target
+		if not cx.layout:move(rail, target, job.side, { focus = false }) then
+			job.stuck[rail] = (job.stuck[rail] or 0) + 1
+			if job.stuck[rail] >= 3 then
+				return release_job(job, "the panel could not be moved to its edge")
+			end
+			warn_once(job, "edge", "Agent Nav: could not move the panel to the " .. job.side .. " edge")
+			return "wait"
+		end
+		lastRailTab = job.tab
+		return "acted"
+	end
+	if math.abs(current - job.share) > SHARE_TOL and not is_clamped(job.tab, job.side, job.share) then
+		local status, pushes, attained = fit_share(cx, job.tab, rail, "right", job.share)
+		if attained then
+			appliedShare, appliedTab = attained, job.tab
+		end
+		if pushes > 0 then
+			if status == "clamped" then
+				remember_clamp(job)
+			end
+			return "acted"
+		end
+		if status == "clamped" then
+			remember_clamp(job)
+		end
+	end
+	set_stage(job, "grow")
+	persist(job)
+	return "again"
+end
+
+local function grow_step(cx: WindowCx, job: Job, rail: number?): string
+	local content = job.content
+	local live = content_of(cx, job.tab, rail)
+	if not content or not live then
+		return empty_job(job)
+	end
+	if job.pending then
+		return pending_step(cx, job)
+	end
+	local result = grow_walk(cx, job, live, content)
+	if result == "acted" or result == "again" then
+		return result
+	end
+	if result == "done" then
+		set_stage(job, "verify")
+		persist(job)
+		return "again"
+	end
+	if result == "retarget" then
+		return release_job(job, "the tab changed while it was being restored")
+	end
+	return "wait"
+end
+
+local function report_drift(job: Job, live: Tree, want: Tree)
+	local worst = 0.0
+	local function walk(a: Tree, b: Tree)
+		local af, bf, as, bs = a.first, b.first, a.second, b.second
+		if not af or not bf or not as or not bs then
+			return
+		end
+		worst = math.max(worst, math.abs((a.ratio or 0.5) - (b.ratio or 0.5)))
+		walk(af, bf)
+		walk(as, bs)
+	end
+	walk(live, want)
+	if worst > SHARE_TOL and not job.warned.drift then
+		job.warned.drift = true
+		tern.log.info(string.format(
+			"Agent Nav: a restored divider sits %.3f from its saved ratio (native resize reaches only the nearest divider of an axis)",
+			worst))
+	end
+end
+
+local function verify_step(cx: WindowCx, job: Job, rail: number?, layout: TabLayout): string
+	local content = job.content
+	local live = content_of(cx, job.tab, rail)
+	if not content then
+		return release_job(job, "nothing left to restore")
+	end
+	if not live or not same_shape(live, content) then
+		set_stage(job, "grow")
+		persist(job)
+		return "again"
+	end
+	if #parked_owned(cx, job) > 0 then
+		set_stage(job, "grow")
+		persist(job)
+		return "again"
+	end
+	if rail and cx.session:tab_of(rail) == job.tab then
+		local current = railShare(layout.root, rail, job.side)
+		if not current then
+			set_stage(job, "clear")
+			persist(job)
+			return "again"
+		end
+		if math.abs(current - job.share) > SHARE_TOL and not is_clamped(job.tab, job.side, job.share) then
+			local status, pushes, attained = fit_share(cx, job.tab, rail, "right", job.share)
+			if attained then
+				appliedShare, appliedTab = attained, job.tab
+			end
+			if pushes > 0 then
+				if status == "clamped" then
+					remember_clamp(job)
+				end
+				return "acted"
+			end
+		end
+		appliedShare, appliedTab = railShare(layout.root, rail, job.side) or current, job.tab
+	end
+	report_drift(job, live, content)
+	local wanted = job.focus
+	if wanted and cx.session:tab_of(wanted) == job.tab then
+		local focused = cx.session:focused()
+		local info = if focused then cx.session:pane(focused) else nil
+		local genuinelyLost = not focused or not info or info.parked == true or (focused == rail and info.tab == job.tab)
+		if genuinelyLost and cx.session:pane(wanted) then
+			cx.layout:focus(wanted)
+			return "acted"
+		end
+	end
+	complete(job, "restored")
+	return "again"
+end
+
+local function step(cx: WindowCx, job: Job, rail: number?): string
+	local layout = cx.session:layout(job.tab)
+	if not layout then
+		return gone(cx, job, rail)
+	end
+	local stage = job.stage
+	if stage == "release" then
+		return release_step(cx, job)
+	end
+	if stage == "attach" then
+		return attach_step(cx, job, rail)
+	end
+	if stage == "clear" then
+		return clear_step(cx, job, rail)
+	end
+	if stage == "rail" then
+		return rail_step(cx, job, rail, layout)
+	end
+	if stage == "grow" then
+		return grow_step(cx, job, rail)
+	end
+	return verify_step(cx, job, rail, layout)
+end
+
+local function reconcile(cx: WindowCx, job: Job, rail: number?)
+	if job.dest and not cx.session:pane(job.dest) then
+		job.dest = nil
+	end
+	adopt_destination(cx, job, rail)
+
+	for pane in job.owned do
+		local info = cx.session:pane(pane)
+		if not info or info.parked ~= true then
+			job.owned[pane] = nil
+		end
+	end
+
+	local content = job.content
+	if content then
+		local pruned: Tree? = content
+		for _, pane in leaves_of(content) do
+			if not pruned then
+				break
+			end
+			local info = cx.session:pane(pane)
+			if not info then
+				pruned = strip_pane(pruned, pane)
+			elseif job.owned[pane] ~= true then
+				local tab = cx.session:tab_of(pane)
+				if (tab and tab ~= job.tab) or (info.parked == true and not tab) then
+					pruned = strip_pane(pruned, pane)
+				end
+			end
+		end
+		job.content = pruned
+		if pruned and not has_pane(pruned, job.anchor) then
+			job.anchor = choose_anchor(cx, job.tab, pruned, rail) or first_leaf(pruned) or job.anchor
+		end
+	end
+
+	if job.focus and not cx.session:pane(job.focus) then
+		job.focus = nil
+	end
+end
+
+local function step_all(cx: WindowCx, job: Job, rail: number?): boolean
+	reconcile(cx, job, rail)
+	local ops = 0
+	local pure = 0
+	local deadline = tern.now() + ADVANCE_MS
+	while ops < MAX_STEPS and pure < 16 and tern.now() < deadline do
+		if state.job ~= job then
+			return false
+		end
+		local result = step(cx, job, rail)
+		if result == "acted" then
+			ops += 1
+			pure = 0
+		elseif result == "again" then
+			pure += 1
+		else
+			return false
+		end
+	end
+	return ops > 0
+end
+
+local function layout_apply(cx: WindowCx, rail: number, tab: number, s: Side, wantShare: number)
+	window_key(cx)
+	local job = state.job
+	if job then
+		if job.share ~= wantShare or job.side ~= s then
+			job.share, job.side = wantShare, s
+			if job.stage ~= "attach" then
+				set_stage(job, "clear")
+			end
+			state.clamped = nil
+			persist(job)
+		end
+		return
+	end
+
+	local from = cx.session:tab_of(rail)
+	if from then
+		noteDrag(cx, from, rail)
+	end
+	share = storedShare()
+	wantShare = share
+
+	local layout = cx.session:layout(tab)
+	if not layout then
+		return
+	end
+	local content = content_of(cx, tab, rail)
+	if not content then
+		if layout.root and layout.root.pane == rail then
+			cx.layout:park(rail)
+			lastRailTab = nil
+		else
+			tern.log.warn("Agent Nav: layout too large or invalid; refusing to restore")
+		end
+		return
+	end
+	local placed = from == tab
+	local current = if placed then railShare(layout.root, rail, s) else nil
+	if placed and current then
+		lastRailTab = tab
+		appliedShare, appliedTab = current, tab
+		if math.abs(current - wantShare) <= SHARE_TOL or is_clamped(tab, s, wantShare) then
+			return
+		end
+	else
+		lastRailTab = from or lastRailTab
+	end
+	local anchor = choose_anchor(cx, tab, content, rail)
+	local session = session_of(cx, tab)
+	if not anchor or not session then
+		return
+	end
+	local members: { [number]: boolean } = {}
+	for _, p in leaves_of(content) do
+		members[p] = true
+	end
+	members[anchor] = true
+
+	local focused = cx.session:focused()
+	local info = tab_info(cx, tab)
+	local newJob: Job = {
+		seq = state.windowSeq,
+		tab = tab,
+		session = session,
+		side = s,
+		share = wantShare,
+		stage = "attach",
+		anchor = anchor,
+		content = content,
+		members = members,
+		owned = {},
+		focus = if focused and focused ~= rail and has_pane(content, focused) then focused else anchor,
+		name = if info and info.name and info.name ~= "" then info.name else nil,
+		dest = nil,
+		pending = nil,
+		warned = {},
+		stuck = {},
+	}
+	if not persist(newJob) then
+		warn_once(newJob, "init_persist", "Agent Nav: failed to save initial layout goal; aborting restore")
+		return
+	end
+	state.job = newJob
+end
+
+local function layout_advance(cx: WindowCx, rail: number?): boolean
+	local job = state.job
+	if not job or state.advancing then
+		return false
+	end
+	state.advancing = true
+	local ok, result = pcall(step_all, cx, job, rail)
+	state.advancing = false
+	if not ok then
+		tern.log.warn("Agent Nav layout: " .. tostring(result))
+		return false
+	end
+	return result == true and state.job ~= nil
+end
+
+local function layout_forget(cx: WindowCx, pane: number, rail: number?)
+	local job = state.job
+	if not job then
+		return
+	end
+	job.owned[pane] = nil
+	if job.focus == pane then
+		job.focus = nil
+	end
+	if job.dest == pane then
+		job.dest = nil
+	end
+	if job.pending and (job.pending.mover == pane or job.pending.anchor == pane or job.pending.owner == pane) then
+		job.pending = nil
+	end
+	if job.content then
+		local pruned = strip_pane(job.content, pane)
+		job.content = pruned
+		if not pruned then
+			set_stage(job, "release")
+		elseif job.anchor == pane then
+			job.anchor = choose_anchor(cx, job.tab, pruned, rail) or first_leaf(pruned) or job.anchor
+		end
+	end
+	persist(job)
+end
+
+local function layout_resume(cx: WindowCx, rail: number?)
+	if state.job or state.resumed then
+		return
+	end
+	state.resumed = true
+	local key = window_key(cx)
+	if not key then
+		return
+	end
+	local doc = journal_load(key)
+	if not doc then
+		return
+	end
+	local job = job_from(doc)
+	if not job then
+		retire_journal(tonumber(doc.seq) or 0)
+		return
+	end
+	state.job = job
+	reconcile(cx, job, rail)
+	if not job.content and #parked_owned(cx, job) == 0 then
+		complete(job, "nothing left to restore")
+		return
+	end
+	tern.log.info("Agent Nav: resuming the layout of tab " .. tostring(job.tab) .. " (" .. job.stage .. ")")
+end
+
+local function layout_busy(): boolean
+	return state.job ~= nil
+end
+
+local function layout_open(cx: WindowCx, tab: number, view: Node): (number?, string?)
+	window_key(cx)
+	if state.job then
+		return nil, "layout restore in progress"
+	end
+	local layout = cx.session:layout(tab)
+	if not layout then
+		return nil, "tab layout not found"
+	end
+	local content = content_of(cx, tab, nil)
+	if not content then
+		return nil, "tab layout too large, invalid, or empty"
+	end
+	local anchor = choose_anchor(cx, tab, content, nil)
+	local session = session_of(cx, tab)
+	if not anchor or not session then
+		return nil, "cannot resolve anchor or session"
+	end
+	local members: { [number]: boolean } = {}
+	for _, p in leaves_of(content) do
+		members[p] = true
+	end
+	members[anchor] = true
+
+	local focused = cx.session:focused()
+	local info = tab_info(cx, tab)
+	local curSide = side()
+	local curShare = storedShare()
+
+	local job: Job = {
+		seq = state.windowSeq,
+		tab = tab,
+		session = session,
+		side = curSide,
+		share = curShare,
+		stage = "attach",
+		anchor = anchor,
+		content = content,
+		members = members,
+		owned = {},
+		focus = if focused and has_pane(content, focused) then focused else anchor,
+		name = if info and info.name and info.name ~= "" then info.name else nil,
+		dest = nil,
+		pending = nil,
+		warned = {},
+		stuck = {},
+	}
+
+	if not persist(job) then
+		return nil, "failed to persist layout journal"
+	end
+	state.job = job
+
+	local pane, err = cx.canvas:open({
+		title = TITLE,
+		about = ABOUT,
+		view = view,
+		how = "beside",
+		target = anchor,
+		focus = false,
+		dir = curSide,
+		ratio = curShare,
+	})
+
+	if not pane then
+		complete(job, "canvas open failed")
+		return nil, tostring(err or "canvas open failed")
+	end
+
+	return pane, nil
+end
 
 -- Persistent state tracking across ticks/events:
 local wasRunning: { [number]: boolean } = {}
 local unreadPanes: { [number]: boolean } = {}
+type SampledPane = {
+	is_running: boolean,
+	ag_state: string?,
+}
+local sampledPanes: { [number]: SampledPane } = {}
+type QueuedLaunch = {
+	session: number,
+	tab: number,
+	target: number?,
+	harness: Harness,
+	command: string,
+	cwd: string?,
+}
+local queuedLaunches: { QueuedLaunch } = {}
 -- Authoritative agent-block states from cx.agents:list(). Kept across ticks:
 -- a failed or oversized list response (daemon frame limit) must degrade to the
 -- last known state, not drop every native agent onto screen heuristics.
 local agentStates: { [number]: string } = {}
 -- Cached screen-state probes. Reading every navigable pane every tick overran
--- Tern's 50 ms plugin hook budget (the hook is then disabled until reload and
--- the panel freezes on stale state), so reads are cached per pane, refreshed
+-- Tern's 50 ms plugin hook budget, pausing the hook with backoff and leaving
+-- stale panel state. Reads are cached per pane, refreshed
 -- immediately when a cheap signal (title, busy, prompt, alert) changes, and
 -- otherwise staggered: at most SCREEN_READS_PER_TICK fresh reads per render,
 -- with each entry re-read at latest after SCREEN_TTL_TICKS.
@@ -281,144 +1812,6 @@ end
 
 local function localHost(cx: WindowCx): boolean
 	return cx.hosts:current().kind == "local"
-end
-
-local function readRail(cx: WindowCx, tab: number, pane: number, s: Side): number?
-	local l = cx.session:layout(tab)
-	return l and railShare(l.root, pane, s)
-end
-
-local function sizeRail(cx: WindowCx, tab: number, pane: number, s: Side, want: number)
-	local toward: Dir = if s == "left" then "right" else "left"
-	steer(function()
-		return readRail(cx, tab, pane, s)
-	end, function(cells)
-		return cx.layout:resize(pane, toward, cells)
-	end, want)
-	appliedShare = readRail(cx, tab, pane, s)
-	appliedTab = tab
-end
-
--- Save manual divider adjustments made by the user. Only a settled rail in a tab
--- whose width this plugin already applied can be a drag: mid-rework the rail
--- sits at the split default (or wherever the moves left it), and reading that as
--- a drag would persist the plugin's own placement width as the remembered share,
--- leaving a multi-block tab half rail ever after.
-local function noteDrag(cx: WindowCx, tab: number, pane: number)
-	if not placedSide or not appliedShare or appliedTab ~= tab or pendingTab == tab then
-		return
-	end
-	local current = readRail(cx, tab, pane, placedSide)
-	if current and math.abs(current - appliedShare) > 0.005 then
-		share = clampShare(current)
-		appliedShare = current
-		tern.kv.set(KV_SHARE, share)
-	end
-end
-
--- Mount the panel in `tab` as the outer rail on the active side.
-local function pin(cx: WindowCx, tab: number)
-	local pane = slot(cx)
-	if not pane then
-		return
-	end
-	local layout = cx.session:layout(tab)
-	if not layout then
-		return
-	end
-	local from = cx.session:tab_of(pane)
-	local s = side()
-
-	if from then
-		noteDrag(cx, from, pane)
-	end
-
-	-- Check if panel is already in target tab and correctly placed on side s.
-	local current = railShare(layout.root, pane, s)
-	if from == tab and current then
-		panelTab, placedSide = tab, s
-		-- Size unless this tab already holds the remembered share: a rework that
-		-- a paused or interrupted hook left half done (rail still at the split
-		-- default) is picked up here. A user drag was absorbed by noteDrag above,
-		-- so `share` already matches it and this stays silent then.
-		if pendingTab ~= tab and (appliedTab ~= tab or appliedShare == nil or math.abs(current - share) > 0.01) then
-			sizeRail(cx, tab, pane, s, share)
-		end
-		return
-	end
-
-	local content = strip(layout.root, pane)
-	if not content then
-		-- Alone in tab: park so the tab closes cleanly.
-		cx.layout:park(pane)
-		return
-	end
-
-	if from ~= tab then
-		if from then
-			cx.layout:move_to_tab(pane, tab, { focus = false })
-		else
-			cx.layout:unpark(pane, { focus = false })
-		end
-	end
-	local ops, fits = rebuild(content, pane, s)
-	for _, op in ops do
-		cx.layout:move(op.pane, op.target, op.dir, { focus = false })
-	end
-
-	-- Restore the rail width and the original content split ratios across ticks
-	-- (settle below): steering every split inside this one hook overran the hook
-	-- budget and Tern paused the hook, freezing the panel.
-	pendingFits = fits
-	pendingSize = true
-	pendingTab = tab
-	panelTab, placedSide = tab, s
-end
-
--- Settle a rework a couple of steps per tick: size the rail, then put back the
--- content ratios the rebuild collapsed. Abandoned when the panel moved again
--- meanwhile (pin re-plans).
-local function settle(cx: WindowCx)
-	if not pendingTab then
-		return
-	end
-	local pane = slot(cx)
-	local tab = pendingTab
-	if not pane or cx.session:tab_of(pane) ~= tab then
-		pendingFits, pendingSize, pendingTab = {}, false, nil
-		return
-	end
-	local s = if placedSide then placedSide else "right"
-	-- Size first: the rebuild left the rail at the split default, and the ratio
-	-- restores below read the content side of the root, which only exists once
-	-- the rail sits on its side again.
-	if pendingSize then
-		pendingSize = false
-		sizeRail(cx, tab, pane, s, share)
-	end
-	local contentSide = if s == "left" then 2 else 1
-	for _ = 1, 2 do
-		local fit = table.remove(pendingFits, 1)
-		if not fit then
-			break
-		end
-		local function read(): number?
-			local l = cx.session:layout(tab)
-			local node = l and l.root and nodeAt(l.root[contentSide], fit.path)
-			return if node and not node.pane then node.ratio or 0.5 else nil
-		end
-		steer(read, function(cells)
-			return cx.layout:resize(fit.edge, fit.dir, cells)
-		end, fit.ratio)
-	end
-	if #pendingFits == 0 then
-		-- Verify the remembered rail width after restoring all content ratios.
-		local current = readRail(cx, tab, pane, s)
-		if current and math.abs(current - share) > 0.01 then
-			sizeRail(cx, tab, pane, s, share)
-		end
-		pendingTab = nil
-	end
 end
 
 --------------------------------------------------------------------------------
@@ -715,26 +2108,77 @@ local function shown_content(cx: WindowCx, session: number): number?
 	return first_content(layout.root, rail)
 end
 
+
 local function open_harness(cx: WindowCx, session: number, h: Harness): boolean
-	local command = if launch_ui() == "tui" then h.tui else h.chat
+	local mode = launch_ui()
+	local command = if mode == "tui" then h.tui else h.chat
 	if not command then
 		return false
 	end
+	menu = nil
+	local in_tab = open_in_tab()
+	if in_tab then
+		local cwd = session_cwd(cx, session)
+		cx.sessions:switch(session)
+		local launch = { command = command, cwd = cwd }
+		local pane = cx.layout:new_tab(launch, { focus = true })
+		if not pane then
+			cx:toast("error", "Agent Nav: Could not open " .. h.label, "")
+		end
+		return true
+	end
+
 	local cwd = session_cwd(cx, session)
 	cx.sessions:switch(session)
-	menu = nil
+	local tab = shownTab(cx)
+	if not tab then
+		cx:toast("error", "Agent Nav: Could not open " .. h.label, "")
+		return true
+	end
+	local target = shown_content(cx, session)
+
+	if layout_busy() or #queuedLaunches > 0 then
+		table.insert(queuedLaunches, {
+			session = session,
+			tab = tab,
+			target = target,
+			harness = h,
+			command = command,
+			cwd = cwd,
+		})
+		return true
+	end
+
 	local launch = { command = command, cwd = cwd }
 	local pane: number?
-	if open_in_tab() then
-		pane = cx.layout:new_tab(launch, { focus = true })
-	else
-		local target = shown_content(cx, session)
-		if target then
-			pane = cx.layout:split(target, "right", launch, { focus = true })
-		end
+	if target then
+		pane = cx.layout:split(target, "right", launch, { focus = true })
 	end
 	if not pane then
 		cx:toast("error", "Agent Nav: Could not open " .. h.label, "")
+	end
+	return true
+end
+
+local function flush_queued_launches(cx: WindowCx): boolean
+	if layout_busy() or #queuedLaunches == 0 then
+		return false
+	end
+	local item = table.remove(queuedLaunches, 1)
+	local cwd = item.cwd or session_cwd(cx, item.session)
+	local info = tab_info(cx, item.tab)
+	local layout = if info and info.session == item.session then cx.session:layout(item.tab) else nil
+	local target = if layout and item.target and in_tree(layout.root, item.target)
+		then item.target
+		elseif layout then first_content(layout.root, slotPane)
+		else nil
+	local pane: number?
+	if target then
+		cx.sessions:switch(item.session)
+		pane = cx.layout:split(target, "right", { command = item.command, cwd = cwd }, { focus = true })
+	end
+	if not pane then
+		cx:toast("error", "Agent Nav: Could not open " .. item.harness.label, "")
 	end
 	return true
 end
@@ -964,7 +2408,7 @@ local function is_navigable_pane(pane_info: any): boolean
 	return false
 end
 
-local function build_view(cx: WindowCx): Node
+local function sample_status(cx: WindowCx)
 	tickCounter += 1
 	screenBudget = SCREEN_READS_PER_TICK
 
@@ -982,41 +2426,17 @@ local function build_view(cx: WindowCx): Node
 		agentStates = fresh
 	end
 
-
-	local tab_to_session: { [number]: number } = {}
-	for _, t in cx.session:tabs() do
-		tab_to_session[t.id] = t.session
-	end
-
-	local session_groups: { [number]: { name: string, agents: { AgentRow } } } = {}
-	local session_order: { number } = {}
-	for _, s in cx.session:sessions() do
-		session_groups[s.id] = { name = s.name, agents = {} }
-		table.insert(session_order, s.id)
-	end
-
+	local freshSampled: { [number]: SampledPane } = {}
 	for _, p in cx.session:panes() do
-		local sid = p.tab and tab_to_session[p.tab]
-		local group = sid and session_groups[sid]
-		if group and sid and is_navigable_pane(p) then
-			local harness, icon = detect_harness(p)
-			-- The window's own focus flag, not a pane-id comparison: the id
-			-- from cx.session:focused() can be truncated (stencil-hq/tern-sdk#30).
+		if is_navigable_pane(p) then
 			local is_focused = p.focused == true
-
-			-- Determine running state reliably across native agents and interactive terminals:
 			local is_running = false
 			local ag_state: string? = agentStates[p.pane]
-			-- Cheap signals a laggy agent block cannot fake: ACP-wrapped CLI
-			-- panes have been seen reporting state="idle" through a real turn.
 			local spinning = spinnerTitle(p.title) or spinnerTitleSuffix(p.title)
 			local busyWorking = p.busy == true and not p.at_prompt
 			if ag_state == "working" or ag_state == "waiting_input" then
-				-- Trust a positive authoritative state.
 				is_running = ag_state == "working"
 			else
-				-- No state, or an idle/exited report: cross-check against the
-				-- cheap signals and the pane's screen before believing idle.
 				is_running = spinning or busyWorking
 				local screen = screenStateCached(cx, p)
 				if screen == "ask" then
@@ -1046,21 +2466,60 @@ local function build_view(cx: WindowCx): Node
 				unreadPanes[p.pane] = nil
 			end
 
+			freshSampled[p.pane] = {
+				is_running = is_running,
+				ag_state = ag_state,
+			}
+		end
+	end
+	sampledPanes = freshSampled
+end
+
+local function build_view(cx: WindowCx): Node
+	if next(sampledPanes) == nil then
+		sample_status(cx)
+	end
+
+	local tab_to_session: { [number]: number } = {}
+	for _, t in cx.session:tabs() do
+		tab_to_session[t.id] = t.session
+	end
+
+	local session_groups: { [number]: { name: string, agents: { AgentRow } } } = {}
+	local session_order: { number } = {}
+	for _, s in cx.session:sessions() do
+		session_groups[s.id] = { name = s.name, agents = {} }
+		table.insert(session_order, s.id)
+	end
+
+	for _, p in cx.session:panes() do
+		local sid = p.tab and tab_to_session[p.tab]
+		local group = sid and session_groups[sid]
+		if group and sid and is_navigable_pane(p) then
+			local harness, icon = detect_harness(p)
+			-- The window's own focus flag, not a pane-id comparison: the id
+			-- from cx.session:focused() can be truncated (stencil-hq/tern-sdk#30).
+			local is_focused = p.focused == true
+
+			local sampled = sampledPanes[p.pane]
+			local is_running = if sampled then sampled.is_running else false
+			local ag_state = if sampled then sampled.ag_state else nil
+
 			-- Status precedence:
 			-- 1. Attention (waiting for user input / approval): purple
 			-- 2. Running: amber/yellow with text shimmer
-			-- 3. Done unread: emerald green
-			-- 4. Error: red
+			-- 3. Error: red (nonzero native exited or error outranks unread)
+			-- 4. Done unread: emerald green
 			-- 5. Done read / idle: muted secondary text
 			local status = "done-read"
 			if ag_state == "waiting_input" then
 				status = "attention"
 			elseif is_running then
 				status = "running"
-			elseif not is_focused and (unreadPanes[p.pane] or p.alert) then
-				status = "done-unread"
 			elseif p.error or (p.exited and p.exited ~= 0) then
 				status = "error"
+			elseif not is_focused and (unreadPanes[p.pane] or p.alert) then
+				status = "done-unread"
 			else
 				status = "done-read"
 			end
@@ -1141,9 +2600,15 @@ end
 local rendered: string? = nil
 local renderedPane: number? = nil
 
+-- Parked rows temporarily have no tab; retain the last view while sampling
+-- status transitions independently of canvas updates.
 local function draw(cx: WindowCx)
+	sample_status(cx)
 	local pane = slot(cx)
 	if not pane then
+		return
+	end
+	if layout_busy() and pane == renderedPane then
 		return
 	end
 	local view = build_view(cx)
@@ -1159,17 +2624,17 @@ end
 -- Tab Following Lifecycle
 --------------------------------------------------------------------------------
 
+-- Capture the content goal before opening the canvas changes its split tree.
 local function openPanel(cx: WindowCx, tab: number)
 	local view = build_view(cx)
-	local pane, err = cx.canvas:open({ title = TITLE, about = ABOUT, view = view, how = "beside", focus = false })
+	local pane, err = layout_open(cx, tab, view)
 	if not pane then
 		cx:toast("error", "Agent Nav: Could not open panel", tostring(err))
 		return
 	end
 	slotPane = pane
 	rendered, renderedPane = tern.json.encode(view), pane
-	appliedShare, appliedTab = nil, nil
-	pin(cx, tab)
+	lastRailTab = cx.session:tab_of(pane)
 end
 
 -- Warn if pane ID exceeds 44 bits (Tern upstream issue stencil-hq/tern-sdk#30).
@@ -1187,39 +2652,68 @@ local function idsResolve(cx: WindowCx): boolean
 	return false
 end
 
--- Keep the panel in the active tab.
+local following = false
+-- Set by the last follow when the controller actually moved something.
+local progressed = false
+local kickPending = false
+local resumed = false
+
+-- Keep the panel in the active tab. Everything that moves a pane is the
+-- controller's job: this only decides where the rail belongs and lets the
+-- controller advance the restore it owns.
 local function follow(cx: WindowCx, tab: number?)
-	if busy or not localHost(cx) or not idsResolve(cx) then
+	progressed = false
+	if following or not localHost(cx) or not idsResolve(cx) then
 		return
 	end
-	local shown = tab or shownTab(cx)
-	if not shown then
-		return
-	end
-	busy = true
+	following = true
 	local ok, err = pcall(function()
+		if not resumed then
+			resumed = true
+			local ok_res, err_res = pcall(layout_resume, cx, slot(cx))
+			if not ok_res then
+				tern.log.warn("Agent Nav resume: " .. tostring(err_res))
+			end
+		end
+		if not layout_busy() and #queuedLaunches > 0 then
+			progressed = flush_queued_launches(cx)
+		end
+
 		local pane = slot(cx)
+		local shown = shownTab(cx) or tab
 		if not pane then
-			if not wantPanel then
+			if layout_busy() or not wantPanel or not shown then
+				progressed = layout_advance(cx, nil)
 				return
 			end
 			-- Reopen if closed with its tab; leave closed if user explicitly closed it.
 			for _, info in cx.session:tabs() do
-				if info.id == panelTab then
+				if info.id == lastRailTab then
 					setWantPanel(false)
-					panelTab = nil
+					lastRailTab = nil
 					return
 				end
 			end
 			openPanel(cx, shown)
-			return
+			pane = slotPane
+			if not pane then
+				return
+			end
 		end
 		if not wantPanel then
 			setWantPanel(true)
 		end
-		pin(cx, shown)
+		if not shown then
+			progressed = layout_advance(cx, pane)
+			return
+		end
+		layout_apply(cx, pane, shown, side(), share)
+		progressed = layout_advance(cx, pane)
 	end)
-	busy = false
+	if ok and not layout_busy() and #queuedLaunches > 0 then
+		progressed = true
+	end
+	following = false
 	if not ok then
 		tern.log.warn("Agent Nav follow: " .. tostring(err))
 	end
@@ -1230,9 +2724,12 @@ local function followAndDraw(cx: WindowCx?, tab: number?)
 		return
 	end
 	follow(cx, tab)
-	local okS, errS = pcall(settle, cx)
-	if not okS then
-		tern.log.warn("Agent Nav settle: " .. tostring(errS))
+	if progressed and not kickPending then
+		kickPending = true
+		tern.timer(FAST_TICK_MS, function(next_cx: WindowCx?)
+			kickPending = false
+			followAndDraw(next_cx)
+		end)
 	end
 	local ok, err = pcall(draw, cx)
 	if not ok then
@@ -1252,17 +2749,18 @@ tern.command({
 		local pane = slot(cx)
 		if pane then
 			setWantPanel(false)
-			panelTab, slotPane, rendered, renderedPane = nil, nil, nil, nil
+			slotPane, rendered, renderedPane = nil, nil, nil
 			menu = nil
-			appliedShare, appliedTab, placedSide = nil, nil, nil
-			pendingFits, pendingSize, pendingTab = {}, false, nil
+			lastRailTab = nil
+			-- A job that still owns parked panes keeps them: closing the rail is
+			-- not a reason to abandon their tab, and the feature stays off.
 			cx.layout:close(pane)
 			return
 		end
 		setWantPanel(true)
-		panelTab = nil
-		appliedShare, appliedTab, placedSide = nil, nil, nil
-		pendingFits, pendingSize, pendingTab = {}, false, nil
+		lastRailTab = nil
+		appliedShare, appliedTab = nil, nil
+		state.clamped = nil
 		warnedIds = false
 		followAndDraw(cx)
 	end,
@@ -1278,6 +2776,7 @@ tern.command({
 			noteDrag(cx, from, pane)
 		end
 		tern.kv.set(KV_SIDE, if side() == "left" then "right" else "left")
+		state.clamped = nil
 		followAndDraw(cx)
 	end,
 })
@@ -1289,11 +2788,10 @@ tern.command({
 		tern.kv.set(KV_SHARE, nil)
 		share = DEFAULT_SHARE
 		appliedShare, appliedTab = nil, nil
-		local pane = slot(cx)
-		local tab = pane and cx.session:tab_of(pane)
-		if pane and tab and placedSide and readRail(cx, tab, pane, placedSide) then
-			sizeRail(cx, tab, pane, placedSide, share)
-		end
+		state.clamped = nil
+		-- The controller re-fits the rail: a finished tab only re-sizes the root
+		-- divider, an unfinished restore carries the new width through.
+		followAndDraw(cx)
 	end,
 })
 
@@ -1315,14 +2813,44 @@ tern.on("focus", function(ev: FocusEvent, cx: WindowCx)
 	followAndDraw(cx, ev.tab)
 end)
 
+-- A pane the host closed is dropped from the restore's goal and from what the
+-- job still owes; the job itself stays until nothing is parked.
+tern.on("pane_closed", function(ev: PaneEvent, cx: WindowCx)
+	wasRunning[ev.pane] = nil
+	unreadPanes[ev.pane] = nil
+	sampledPanes[ev.pane] = nil
+	layout_forget(cx, ev.pane, slot(cx))
+	followAndDraw(cx)
+end)
+
+tern.on("tab_closed", function(ev: TabEvent, cx: WindowCx)
+	if lastRailTab == ev.tab then
+		lastRailTab = nil
+	end
+	followAndDraw(cx)
+end)
+
+-- A session that ended took its panes with it; the controller retires only the
+-- members that are actually gone and never launches a program to replace one.
+tern.on("session_ended", function(_ev: SessionEndedEvent, cx: WindowCx)
+	followAndDraw(cx)
+end)
+
 -- Re-render immediately on window events, pane title changes, and agent turn completions.
-for _, name in { "tab_created", "tab_closed", "pane_created", "pane_closed", "title", "agent_finished" } do
+for _, name in { "tab_created", "pane_created", "title", "agent_finished" } do
 	tern.on(name, function(_ev: any, cx: WindowCx)
 		followAndDraw(cx)
 	end)
 end
 
+-- A window that starts again resumes the restore its journal still owns before
+-- following the newest placement, so parked panes are never left behind.
 tern.on("window_start", function(cx: WindowCx)
+	resumed = true
+	local ok, err = pcall(layout_resume, cx, slot(cx))
+	if not ok then
+		tern.log.warn("Agent Nav resume: " .. tostring(err))
+	end
 	followAndDraw(cx)
 end)
 

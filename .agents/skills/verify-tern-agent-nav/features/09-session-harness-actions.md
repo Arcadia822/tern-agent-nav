@@ -18,6 +18,7 @@ Each workspace header has **+** followed by **…**. The plus button starts omp 
 - With it off, both entry points split the new block off the right of the agent block the clicked workspace's shown tab displays, in that same tab: the workspace's tab count is unchanged and focus lands on the new block. A non-first shown tab splits in that tab, not the first, and clicking from another current workspace splits the clicked workspace's shown tab.
 - With it off and the navigator rail focused, the click still splits the rail's content sibling: the rail is never the split target.
 - A launch that cannot resolve a content target keeps the existing error toast and adds no tab (it does not fall back to a new tab).
+- Queue a real harness selection in tab A while restoration owns parked panes, then select tab B in the same session before the launch drains. The launched block must belong to A. If A is closed first, no harness may start in B or another tab; verify with a controlled local ACP registration and a successful launch case before asserting absence.
 - OMP is the first item. Tern's built-in Claude Code, Codex, and GitHub Copilot registrations follow it, then `agents.custom` in configured order. No installation-file or PATH discovery runs.
 - A custom agent with a recognizable name has its harness icon. Other names have a UTF-8 first-character avatar.
 - Selecting a built-in in Native TUI mode bypasses Tern's automatic ACP shell wrapper. Tern Chat UI mode opens that agent through `tern acp`.
