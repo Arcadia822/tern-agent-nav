@@ -1,6 +1,11 @@
-/* Agent Navigations rail. Every color is a Tern theme variable, so rows follow
-   light/dark mode and the chosen color theme (--t1..--t4, --ok, --warn, --bad, --ansiN). */
+/* Rail chrome follows the Tern theme. Status hues retain their meaning across
+   color themes, with separate light/dark values for readable status text. */
 .agent-nav-root {
+    --agent-nav-running: light-dark(#854d0e, #f5a524);
+    --agent-nav-running-bg: light-dark(#ffed99, transparent);
+    --agent-nav-running-shine: light-dark(#422006, #ffe08a);
+    --agent-nav-unread: light-dark(#15803d, #3ecf8e);
+    --agent-nav-error: light-dark(#c1121f, #ff6166);
     position: relative;
     display: flex;
     flex-direction: column;
@@ -75,20 +80,30 @@
 }
 
 /* Row states. */
-.agent-nav-agent.status-running { color: var(--warn); }
+.agent-nav-agent.status-running {
+    color: var(--agent-nav-running);
+    background: var(--agent-nav-running-bg);
+}
+.agent-nav-agent.status-running:hover,
+.agent-nav-agent.status-running:focus-visible {
+    background: light-dark(#ffe88a, var(--l1));
+}
+.agent-nav-agent.status-running.is-current,
+.agent-nav-agent.status-running.is-current:hover,
+.agent-nav-agent.status-running:active {
+    background: light-dark(#ffe373, var(--l2));
+}
 .agent-nav-agent.status-attention { color: var(--ansi5); }
-.agent-nav-agent.status-done-unread { color: var(--ok); }
-.agent-nav-agent.status-error { color: var(--bad); }
+.agent-nav-agent.status-done-unread { color: var(--agent-nav-unread); }
+.agent-nav-agent.status-error { color: var(--agent-nav-error); font-weight: 600; }
 .agent-nav-agent.status-done-read { color: var(--t2); }
 
-/* Running: Tern's native per-character shimmer (the sweep omp's working label
-   uses). A full-strength band of the theme's warning color passes over a faded
-   rest, so the sweep keeps its contrast in every light, dark and color theme
-   (blending toward --t1 vanishes in themes whose warning color is near white). */
+/* Opaque text keeps its contrast throughout the native shimmer: a darker sweep
+   over the light yellow row in light mode, a brighter sweep in dark mode. */
 .agent-nav-agent.status-running .agent-nav-title .sf-shimmer {
-    --sh-lo: color-mix(in srgb, var(--warn) 45%, transparent);
-    --sh-mid: color-mix(in srgb, var(--warn) 75%, transparent);
-    --sh-hi: var(--warn);
+    --sh-lo: var(--agent-nav-running);
+    --sh-mid: color-mix(in srgb, var(--agent-nav-running) 50%, var(--agent-nav-running-shine));
+    --sh-hi: var(--agent-nav-running-shine);
 }
 
 /* Harness logo: a 16px box aligned with the header and session text. */

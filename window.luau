@@ -215,14 +215,19 @@ end
 local slotPane: number? = nil
 local panelTab: number? = nil
 local placedSide: Side? = nil
+-- The rail's width as this plugin last measured or set it, and the tab that
+-- width belongs to: `appliedShare` says nothing about any other tab, so a
+-- pending rework must not be mistaken for the user dragging the divider.
 local appliedShare: number? = nil
+local appliedTab: number? = nil
 local share = storedShare()
 local busy = false
 local warnedIds = false
--- Ratio restore and rail sizing are spread across ticks: a full rebuild with
--- 8-step steering per split inside one hook overran Tern's 50 ms plugin
--- budget, and Tern then disables the hook until reload, which freezes the
--- panel on stale state.
+-- A tab switch rebuilds the destination around the rail, which leaves the rail
+-- at the split default until it is sized and its content ratios are restored;
+-- that work is spread across ticks because a full rebuild with 8-step steering
+-- per split inside one hook overran Tern's plugin hook budget, after which Tern
+-- pauses the hook and the panel freezes on stale state.
 local pendingFits: { Fit } = {}
 local pendingSize = false
 local pendingTab: number? = nil
@@ -291,11 +296,16 @@ local function sizeRail(cx: WindowCx, tab: number, pane: number, s: Side, want: 
 		return cx.layout:resize(pane, toward, cells)
 	end, want)
 	appliedShare = readRail(cx, tab, pane, s)
+	appliedTab = tab
 end
 
--- Save manual divider adjustments made by the user.
+-- Save manual divider adjustments made by the user. Only a settled rail in a tab
+-- whose width this plugin already applied can be a drag: mid-rework the rail
+-- sits at the split default (or wherever the moves left it), and reading that as
+-- a drag would persist the plugin's own placement width as the remembered share,
+-- leaving a multi-block tab half rail ever after.
 local function noteDrag(cx: WindowCx, tab: number, pane: number)
-	if not placedSide or not appliedShare then
+	if not placedSide or not appliedShare or appliedTab ~= tab or pendingTab == tab then
 		return
 	end
 	local current = readRail(cx, tab, pane, placedSide)
@@ -324,10 +334,14 @@ local function pin(cx: WindowCx, tab: number)
 	end
 
 	-- Check if panel is already in target tab and correctly placed on side s.
-	if from == tab and railShare(layout.root, pane, s) then
+	local current = railShare(layout.root, pane, s)
+	if from == tab and current then
 		panelTab, placedSide = tab, s
-		-- If not yet sized (e.g. freshly opened with default 50% split), size now.
-		if not appliedShare then
+		-- Size unless this tab already holds the remembered share: a rework that
+		-- a paused or interrupted hook left half done (rail still at the split
+		-- default) is picked up here. A user drag was absorbed by noteDrag above,
+		-- so `share` already matches it and this stays silent then.
+		if pendingTab ~= tab and (appliedTab ~= tab or appliedShare == nil or math.abs(current - share) > 0.01) then
 			sizeRail(cx, tab, pane, s, share)
 		end
 		return
@@ -352,17 +366,18 @@ local function pin(cx: WindowCx, tab: number)
 		cx.layout:move(op.pane, op.target, op.dir, { focus = false })
 	end
 
-	-- Restore original content split ratios and the rail width across ticks
-	-- (settle below): steering every split inside this one hook overran the
-	-- 50 ms budget and Tern disabled the hook, freezing the panel.
+	-- Restore the rail width and the original content split ratios across ticks
+	-- (settle below): steering every split inside this one hook overran the hook
+	-- budget and Tern paused the hook, freezing the panel.
 	pendingFits = fits
 	pendingSize = true
 	pendingTab = tab
 	panelTab, placedSide = tab, s
 end
 
--- Work through the pending ratio restores a couple per tick, then size the
--- rail. Abandoned when the panel moved again meanwhile (pin re-plans).
+-- Settle a rework a couple of steps per tick: size the rail, then put back the
+-- content ratios the rebuild collapsed. Abandoned when the panel moved again
+-- meanwhile (pin re-plans).
 local function settle(cx: WindowCx)
 	if not pendingTab then
 		return
@@ -374,6 +389,13 @@ local function settle(cx: WindowCx)
 		return
 	end
 	local s = if placedSide then placedSide else "right"
+	-- Size first: the rebuild left the rail at the split default, and the ratio
+	-- restores below read the content side of the root, which only exists once
+	-- the rail sits on its side again.
+	if pendingSize then
+		pendingSize = false
+		sizeRail(cx, tab, pane, s, share)
+	end
 	local contentSide = if s == "left" then 2 else 1
 	for _ = 1, 2 do
 		local fit = table.remove(pendingFits, 1)
@@ -389,14 +411,15 @@ local function settle(cx: WindowCx)
 			return cx.layout:resize(fit.edge, fit.dir, cells)
 		end, fit.ratio)
 	end
-	if #pendingFits == 0 and pendingSize then
-		pendingSize = false
-		sizeRail(cx, tab, pane, s, share)
-	end
-	if #pendingFits == 0 and not pendingSize then
+	if #pendingFits == 0 then
+		-- Verify the remembered rail width after restoring all content ratios.
+		local current = readRail(cx, tab, pane, s)
+		if current and math.abs(current - share) > 0.01 then
+			sizeRail(cx, tab, pane, s, share)
+		end
 		pendingTab = nil
 	end
- end
+end
 
 --------------------------------------------------------------------------------
 -- View
@@ -1145,7 +1168,7 @@ local function openPanel(cx: WindowCx, tab: number)
 	end
 	slotPane = pane
 	rendered, renderedPane = tern.json.encode(view), pane
-	appliedShare = nil
+	appliedShare, appliedTab = nil, nil
 	pin(cx, tab)
 end
 
@@ -1231,14 +1254,14 @@ tern.command({
 			setWantPanel(false)
 			panelTab, slotPane, rendered, renderedPane = nil, nil, nil, nil
 			menu = nil
-			appliedShare, placedSide = nil, nil
+			appliedShare, appliedTab, placedSide = nil, nil, nil
 			pendingFits, pendingSize, pendingTab = {}, false, nil
 			cx.layout:close(pane)
 			return
 		end
 		setWantPanel(true)
 		panelTab = nil
-		appliedShare, placedSide = nil, nil
+		appliedShare, appliedTab, placedSide = nil, nil, nil
 		pendingFits, pendingSize, pendingTab = {}, false, nil
 		warnedIds = false
 		followAndDraw(cx)
@@ -1265,7 +1288,7 @@ tern.command({
 	run = function(cx)
 		tern.kv.set(KV_SHARE, nil)
 		share = DEFAULT_SHARE
-		appliedShare = nil
+		appliedShare, appliedTab = nil, nil
 		local pane = slot(cx)
 		local tab = pane and cx.session:tab_of(pane)
 		if pane and tab and placedSide and readRail(cx, tab, pane, placedSide) then
