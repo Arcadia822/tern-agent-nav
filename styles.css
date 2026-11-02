@@ -76,8 +76,11 @@
 .agent-nav-agent.is-current,
 .agent-nav-agent.is-current:hover,
 .agent-nav-agent.is-current:focus-visible,
-.agent-nav-agent.is-current:active { background: rgba(128, 128, 128, 0.08); }
-.agent-nav-agent:focus-visible { outline: 1px solid var(--l4); outline-offset: -1px; }
+.agent-nav-agent.is-current:active {
+    /* Tint of the theme's strongest text color, so the selected agent reads in
+       both appearances: dark text over a light surface, light over dark. */
+    background: color-mix(in srgb, var(--t1) 16%, transparent);
+}
 
 .agent-nav-title {
     min-width: 0;

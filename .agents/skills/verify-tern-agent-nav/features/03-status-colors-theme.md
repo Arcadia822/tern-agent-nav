@@ -18,8 +18,11 @@ running text is `light-dark(#854d0e, #f5a524)`, unread is
 `light-dark(#15803d, #3ecf8e)`, and error is `light-dark(#c1121f, #ff6166)`.
 Light mode uses an opaque darker shimmer sweep (`#422006`); dark mode uses a
 brighter sweep. Unfocused rows stay transparent in every interaction state.
-The focused row alone uses fixed `rgba(128, 128, 128, 0.08)`, independent of
-agent status. Error rows are semibold to strengthen the text cue.
+The selected (focused) agent row alone carries a background:
+`color-mix(in srgb, var(--t1) 16%, transparent)` — a tint of the theme's
+strongest text color, so it reads in light and dark alike and stays independent of
+agent status. No other row state paints a background, and the selection adds no
+edge or border. Error rows are semibold to strengthen the text cue.
 These hues must stay distinct in `light-forest`, whose warning and success colors
 both lean green and whose error color is brown/orange. Attention, idle text and
 rail chrome continue using Tern theme variables.
