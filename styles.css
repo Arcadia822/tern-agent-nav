@@ -215,6 +215,13 @@
     font-weight: 600;
 }
 
+/* An unknown harness in a row keeps the logo's 16px slot, so titles still align. */
+.agent-nav-agent .agent-nav-avatar {
+    width: 16px;
+    height: 16px;
+    font-size: 10px;
+}
+
 .agent-nav-mode {
     display: flex;
     align-items: center;

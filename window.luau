@@ -35,6 +35,8 @@ for _, key in { "agent_nav.width", "agent_nav.auto_tabs", "agent_nav.omp_debug",
 	end
 end
 
+-- Names match as whole words (`harness_icon`), so every variant a CLI ships as
+-- gets its own entry: `cursor-agent` is the Cursor CLI's binary name.
 local HARNESS_ICONS: { [string]: string } = {
 	omp = "app-omp",
 	hermes = "app-hermes",
@@ -48,6 +50,7 @@ local HARNESS_ICONS: { [string]: string } = {
 	gemini = "mi-gemini-ai",
 	["gemini-cli"] = "mi-gemini-ai",
 	cursor = "mi-cursor",
+	["cursor-agent"] = "mi-cursor",
 	opencode = "mi-code",
 	kimi = "sparkle",
 	kilo = "sparkle",
@@ -63,16 +66,15 @@ local BUILTIN_AGENTS: { { id: string, label: string } } = {
 
 type Side = "left" | "right"
 
+type Badge = { kind: "icon", name: string } | { kind: "letter", text: string }
 type AgentRow = {
 	pane: number,
 	session: number,
 	title: string,
-	icon: string,
+	badge: Badge,
 	status: string,
 	is_current: boolean,
 }
-
-type Badge = { kind: "icon", name: string } | { kind: "letter", text: string }
 type LaunchUI = "tui" | "chat"
 type Harness = { id: string, label: string, badge: Badge, tui: string?, chat: string }
 type Menu = { session: number, items: { Harness } }
@@ -1765,10 +1767,16 @@ type QueuedLaunch = {
 	launch: Launch,
 }
 local queuedLaunches: { QueuedLaunch } = {}
--- Authoritative agent-block states from cx.agents:list(). Kept across ticks:
--- a failed or oversized list response (daemon frame limit) must degrade to the
--- last known state, not drop every native agent onto screen heuristics.
-local agentStates: { [number]: string } = {}
+-- Authoritative agent blocks from cx.agents:list(): the state drives progress, and
+-- the command the block was opened with is the only harness name a fresh native
+-- agent has before it writes a session title. Kept across ticks: a failed or
+-- oversized list response (daemon frame limit) must degrade to the last known
+-- values, not drop every native agent onto screen heuristics.
+local agentInfo: { [number]: { state: string, command: string } } = {}
+-- Panes whose agent block reported a turn (working or waiting for input). Tern
+-- opens every command block as an agent block, so this is the only evidence that
+-- separates a real agent from a launched command such as `pnpm run`.
+local everActive: { [number]: boolean } = {}
 -- Cached screen-state probes. Reading every navigable pane every tick overran
 -- Tern's 50 ms plugin hook budget, pausing the hook with backoff and leaving
 -- stale panel state. Reads are cached per pane, refreshed
@@ -1946,22 +1954,16 @@ end
 -- Harness actions
 --------------------------------------------------------------------------------
 
--- Harness keys in a fixed order: table iteration order is not, and a menu entry
--- must match exactly like the row it mirrors.
-local HARNESS_KEYS: { string } = {}
-for key in HARNESS_ICONS do
-	table.insert(HARNESS_KEYS, key)
-end
-table.sort(HARNESS_KEYS)
-
+-- A harness name counts only as a whole token of the text it is found in: a plain
+-- substring scan reads "components", "prompt" and "compile" as omp, so a `pnpm run`
+-- block became an agent row wearing omp's logo. Tokens are runs of letters, digits
+-- and hyphens, which keeps `claude-code` and `codex-acp` whole and splits paths and
+-- prose into their own words.
 local function harness_icon(text: string): (string?, string?)
-	local lower = string.lower(text)
-	if lower == "" then
-		return nil, nil
-	end
-	for _, key in HARNESS_KEYS do
-		if string.find(lower, key, 1, true) then
-			return key, HARNESS_ICONS[key]
+	for token in string.gmatch(string.lower(text), "[%w%-]+") do
+		local icon = HARNESS_ICONS[token]
+		if icon then
+			return token, icon
 		end
 	end
 	return nil, nil
@@ -1969,6 +1971,12 @@ end
 
 local function letter_of(name: string): string
 	local ok, letter = pcall(function()
+		-- A path-like title ("/tmp/project") names its first letter, not a separator.
+		local start = string.find(name, "[%w]")
+		if start then
+			return string.upper(string.sub(name, start, start))
+		end
+		-- Names without an ASCII letter or digit keep their first visible character.
 		local i = 1
 		while i <= #name do
 			local cp = utf8.codepoint(name, i)
@@ -2388,7 +2396,9 @@ local function detect_harness(pane_info: any): (string, string)
 		return "carly", "sparkle"
 	end
 	-- The foreground command names the harness most reliably: `program` can report
-	-- the shell, and titles (Codex: "<task> | <dir>") need not mention the agent.
+	-- the shell, and titles (Codex: "<task> | <dir>") need not mention the agent. A
+	-- native agent block also knows the command it was opened with, which is the only
+	-- harness name it has before its first session title, so that comes first.
 	local running = pane_info.running
 	local line = string.lower(if running and type(running.line) == "string" then running.line else "")
 	local command = string.match(line, "^%s*([^%s]+)") or ""
@@ -2397,14 +2407,18 @@ local function detect_harness(pane_info: any): (string, string)
 	local probed = if fg then fg.argv else ""
 	local prog = string.lower(pane_info.program or "")
 	local title = string.lower(pane_info.title or "")
-	for _, source in { command, probed, prog, title } do
+	local info = agentInfo[pane_info.pane]
+	local opened = if info then info.command else ""
+	for _, source in { opened, command, probed, prog, title } do
 		local key, icon = harness_icon(source)
 		if key and icon then
 			return key, icon
 		end
 	end
 	if pane_info.kind == "agent" then
-		return "agent", "app-omp"
+		-- An agent block with no harness name yet is still an agent, but nothing
+		-- proves which one: an empty icon becomes a first-letter avatar, never omp's.
+		return "agent", ""
 	end
 	return "terminal", "terminal"
 end
@@ -2413,8 +2427,16 @@ local function is_navigable_pane(pane_info: any): boolean
 	if pane_info.block == "tern.canvas" then
 		return false
 	end
-	if pane_info.kind == "agent" or pane_info.kind == "carly" then
+	if pane_info.kind == "carly" then
 		return true
+	end
+	if pane_info.kind == "agent" then
+		-- Tern opens every command block as an agent block, so kind alone proves
+		-- nothing: a launched `pnpm run` sits in cx.agents:list() as an idle agent
+		-- forever. Keep the row when its harness is named, or when its program
+		-- reported a turn (latched in everActive).
+		local harness, _ = detect_harness(pane_info)
+		return harness ~= "agent" or everActive[pane_info.pane] == true
 	end
 	if pane_info.kind == "terminal" then
 		local harness, _ = detect_harness(pane_info)
@@ -2430,18 +2452,31 @@ local function sample_status(cx: WindowCx)
 	tickCounter += 1
 	screenBudget = SCREEN_READS_PER_TICK
 
-	-- Query native agent blocks for authoritative first-class state; on
-	-- failure (for example a response too large for the daemon frame) keep
-	-- the previous snapshot.
+	-- Query native agent blocks for authoritative first-class state and the command
+	-- each was opened with; on failure (for example a response too large for the
+	-- daemon frame) keep the previous snapshot.
 	local ok_ag, ag_list = pcall(function() return cx.agents:list() end)
 	if ok_ag and type(ag_list) == "table" then
-		local fresh: { [number]: string } = {}
+		local fresh: { [number]: { state: string, command: string } } = {}
 		for _, a in ag_list do
 			if a.pane and a.state then
-				fresh[a.pane] = a.state
+				fresh[a.pane] = {
+					state = a.state,
+					command = string.lower(if type(a.command) == "string" then a.command else ""),
+				}
 			end
 		end
-		agentStates = fresh
+		agentInfo = fresh
+		-- Keep the panes that have reported a turn. Tern offers no field that says
+		-- "this block runs an agent", so a first turn is the proof a bare command
+		-- block never gives.
+		local active: { [number]: boolean } = {}
+		for pane, info in fresh do
+			if everActive[pane] or info.state == "working" or info.state == "waiting_input" then
+				active[pane] = true
+			end
+		end
+		everActive = active
 	end
 
 	local freshSampled: { [number]: SampledPane } = {}
@@ -2449,7 +2484,8 @@ local function sample_status(cx: WindowCx)
 		if is_navigable_pane(p) then
 			local is_focused = p.focused == true
 			local is_running = false
-			local ag_state: string? = agentStates[p.pane]
+			local agent = agentInfo[p.pane]
+			local ag_state: string? = if agent then agent.state else nil
 			local spinning = spinnerTitle(p.title) or spinnerTitleSuffix(p.title)
 			local busyWorking = p.busy == true and not p.at_prompt
 			if ag_state == "working" or ag_state == "waiting_input" then
@@ -2549,11 +2585,16 @@ local function build_view(cx: WindowCx): Node
 				title = if harness == "omp" then "omp" else (p.cwd and string.match(p.cwd, "([^/\\]+)$") or ("Pane " .. tostring(p.pane)))
 			end
 
+			-- An unknown harness keeps the row but not a wrong logo: it gets the
+			-- first-letter avatar the harness menu already uses for unknown names.
+			local badge: Badge = if icon ~= ""
+				then { kind = "icon", name = icon }
+				else { kind = "letter", text = letter_of(title) }
 			table.insert(group.agents, {
 				pane = p.pane,
 				session = sid,
 				title = title,
-				icon = icon,
+				badge = badge,
 				status = status,
 				is_current = is_focused,
 			})
@@ -2578,9 +2619,7 @@ local function build_view(cx: WindowCx): Node
 					class = "agent-nav-agent status-" .. ag.status .. (if ag.is_current then " is-current" else ""),
 					attrs = { title = ag.title .. " · " .. ag.status },
 				}, {
-					ui.el("span", { class = "agent-nav-logo", attrs = { ["aria-hidden"] = "true" } }, {
-						ui.node("icon", { name = ag.icon }),
-					}),
+					badge_node(ag.badge),
 					-- Running titles use Tern's native per-character shimmer (the sweep omp's
 					-- working label uses); its colors come from --sh-* in styles.css.
 					if ag.status == "running"
