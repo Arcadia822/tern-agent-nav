@@ -21,6 +21,11 @@
     overflow-y: auto;
 }
 .agent-nav-root * { box-sizing: border-box; }
+
+/* Tern 0.9.9 tags every plugin `button` with `.sf-el` and gives it surface-button
+   chrome: `justify-content: center`, a `--chip-bg` fill, an inset `--l2` ring and a
+   fixed 28px height (`surface-el.css`). Properties our rules do not name leak
+   through, so every button class here states its own box, alignment and shadow. */
 .agent-nav-header {
     display: flex;
     align-items: center;
@@ -48,6 +53,7 @@
 .agent-nav-agent {
     display: flex;
     align-items: center;
+    justify-content: flex-start;
     gap: 8px;
     width: 100%;
     min-width: 0;
@@ -58,6 +64,7 @@
     border: 0;
     border-radius: 0;
     background: transparent;
+    box-shadow: none;
     text-align: left;
     font: 400 13px/1.4 var(--sans);
     color: var(--t2);
@@ -138,6 +145,7 @@
     border: 0;
     border-radius: 4px;
     background: transparent;
+    box-shadow: none;
     color: var(--t3);
     cursor: pointer;
 }
@@ -175,10 +183,13 @@
 .agent-nav-menu-item {
     display: flex;
     align-items: center;
+    justify-content: flex-start;
     gap: 8px;
+    height: auto;
     border: 0;
     border-radius: 4px;
     background: transparent;
+    box-shadow: none;
     text-align: left;
     color: var(--t2);
     cursor: pointer;
@@ -246,6 +257,8 @@
     position: fixed;
     inset: 0;
     z-index: 4;
+    height: auto;
+    box-shadow: none;
     border: 0;
     padding: 0;
     background: transparent;
