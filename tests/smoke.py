@@ -626,6 +626,21 @@ tern.command({{ id = "create_fixture_agent", title = "Fixture: Create Agent", ru
     }})
 end }})
 
+tern.command({{ id = "position_fixture", title = "Fixture: Position Block", run = function(cx)
+    local spec = tern.json.decode(assert(tern.fs.read(target_file)))
+    assert(created_fixture_panes[spec.pane] and created_fixture_panes[spec.target], "fixture panes required")
+    assert(cx.layout:move(spec.pane, spec.target, spec.dir, {{focus = false}}))
+    write_ack({{op = "position_fixture"}})
+end }})
+
+tern.command({{ id = "order_fixture_tab", title = "Fixture: Order Tab", run = function(cx)
+    local spec = tern.json.decode(assert(tern.fs.read(target_file)))
+    assert(created_fixture_panes[spec.pane], "fixture pane required")
+    local tab = assert(cx.session:tab_of(spec.pane))
+    cx.layout:order_tab(tab, spec.position)
+    write_ack({{op = "order_fixture_tab"}})
+end }})
+
 for _, dir in {{ "down", "right" }} do
     local direction = dir
     tern.command({{ id = "split_content_" .. direction, title = "Fixture: Split " .. direction, run = function(cx)
@@ -796,12 +811,13 @@ def is_transparent_bg(bg: str) -> bool:
     return bool(match and float(match.group(1)) == 0.0)
 
 
-def is_faint_neutral_grey_bg(bg: str) -> bool:
-    match = re.fullmatch(r"rgba\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*([0-9.]+)\s*\)", bg.strip().lower())
-    if not match:
-        return False
-    red, green, blue, alpha = map(float, match.groups())
-    return red == green == blue and 0.0 < alpha <= 0.15
+def bg_alpha(bg: str) -> float:
+    """Alpha channel of a computed background color (`transparent` is 0)."""
+    value = bg.strip().lower()
+    if value == "transparent":
+        return 0.0
+    match = re.fullmatch(r"rgba\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*([0-9.]+)\s*\)", value)
+    return float(match.group(1)) if match else 1.0
 
 
 def project_content_tree(tree: Optional[Dict[str, Any]], nav_pane: int) -> Optional[Dict[str, Any]]:
@@ -904,7 +920,13 @@ def require_unlocked_desktop():
 class SmokeRunner:
     """Regression runner operating in isolated fixture sessions against an existing Tern GUI window."""
 
-    TOUCHED_KEYS = ("agent_nav.enabled", "agent_nav.side", "agent_nav.share")
+    TOUCHED_KEYS = (
+        "agent_nav.enabled",
+        "agent_nav.side",
+        "agent_nav.share",
+        "agent_nav.group_tabs",
+        "agent_nav.minimap",
+    )
 
     def __init__(self, args: argparse.Namespace):
         require_unlocked_desktop()
@@ -912,6 +934,7 @@ class SmokeRunner:
         self.args = args
         self.tern_bin = Path(args.tern).resolve()
         self.package_dir = Path(args.plugin).resolve()
+        self.control = getattr(args, "control", None)
         self.artifacts_dir = Path(args.artifacts).resolve() if args.artifacts else None
         self.soak_seconds = float(args.soak_seconds)
         self.click_only = bool(args.click_only)
@@ -965,6 +988,19 @@ class SmokeRunner:
 
     def find_linked_source(self) -> Optional[Path]:
         """Find the currently linked directory for the agent-nav plugin."""
+        config = os.environ.get("TERN_CONFIG_DIR")
+        if config:
+            # An explicit config dir is the only source: the caller's real HOME
+            # install belongs to another daemon and must never be re-linked.
+            candidate = Path(config) / "plugins" / "agent-nav.path"
+            if candidate.exists():
+                try:
+                    target = candidate.read_text().strip()
+                    if target:
+                        return Path(target).resolve()
+                except Exception:
+                    pass
+            return None
         candidates = [
             Path.home() / "Library" / "Application Support" / "Tern" / "plugins" / "agent-nav.path",
             Path.home() / ".config" / "tern" / "plugins" / "agent-nav.path",
@@ -980,14 +1016,22 @@ class SmokeRunner:
         return None
 
     def find_kv_path(self) -> Path:
-        """Find the real kv.json file for the installed agent-nav plugin."""
+        """Find the kv.json of the agent-nav plugin the driven window actually loads."""
+        config = os.environ.get("TERN_CONFIG_DIR")
+        if config:
+            # Explicit sandbox config: never fall back to the real HOME install,
+            # whose kv.json belongs to the production daemon.
+            plugin_data = os.environ.get("TERN_PLUGIN_DATA")
+            if plugin_data:
+                candidate = Path(plugin_data) / "agent-nav" / "kv.json"
+                if candidate.exists():
+                    return candidate.resolve()
+            return (Path(config) / "plugin-data" / "agent-nav" / "kv.json").resolve()
         candidates = []
         if "TERN_PLUGIN_DATA" in os.environ:
             candidates.append(Path(os.environ["TERN_PLUGIN_DATA"]) / "agent-nav" / "kv.json")
         candidates.append(Path.home() / "Library" / "Application Support" / "Tern" / "plugin-data" / "agent-nav" / "kv.json")
         candidates.append(Path.home() / ".config" / "tern" / "plugin-data" / "agent-nav" / "kv.json")
-        if "TERN_CONFIG_DIR" in os.environ:
-            candidates.append(Path(os.environ["TERN_CONFIG_DIR"]) / "plugin-data" / "agent-nav" / "kv.json")
         for p in candidates:
             if p.exists():
                 return p.resolve()
@@ -1000,6 +1044,10 @@ class SmokeRunner:
 
     def find_log_path(self) -> Optional[Path]:
         """Locate the main tern.log file."""
+        log_dir = os.environ.get("STENCIL_LOG_DIR")
+        if log_dir:
+            candidate = Path(log_dir) / "tern.log"
+            return candidate.resolve() if candidate.exists() else None
         candidates = [
             Path.home() / "Library" / "Logs" / "Tern" / "tern.log",
             Path.home() / ".local" / "share" / "tern" / "tern.log",
@@ -1298,10 +1346,14 @@ class SmokeRunner:
     def ctl(self, *words: str) -> Dict[str, Any]:
         """Execute a control command via native tern ctl directly to the running window."""
         command = " ".join(words) if words[0] in ("dump", "tree") else " ".join(
-            word if re.fullmatch(r"[A-Za-z0-9_.:/-]+", word) else json.dumps(word) for word in words
+            word if re.fullmatch(r"[A-Za-z0-9_.:/-]+", word) else json.dumps(word, ensure_ascii=False) for word in words
         )
+        argv = [str(self.tern_bin), "ctl"]
+        if self.control:
+            argv.extend(["--control", str(self.control)])
+        argv.append(command)
         output = subprocess.run(
-            [str(self.tern_bin), "ctl", command],
+            argv,
             capture_output=True,
             text=True,
             timeout=30,
@@ -1370,9 +1422,7 @@ class SmokeRunner:
     def start_client_dir(self) -> Path:
         """Allocate a per-agent wire directory inside the fixture temp root."""
         assert self.base is not None, "Fixture temp root is not set up"
-        wire_dir = self.base / f"agent-{len(self.client_dirs) + 1}"
-        wire_dir.mkdir()
-        return wire_dir
+        return Path(tempfile.mkdtemp(prefix="agent-", dir=self.base))
 
     def client_dir(self, pane: int) -> Path:
         wire_dir = self.client_dirs.get(pane)
@@ -1753,6 +1803,24 @@ class SmokeRunner:
     def dump(self, selector: str) -> List[Dict[str, Any]]:
         return self.ctl("dump", selector).get("elements", [])
 
+    def map_cell_backgrounds(self, tab_id: int) -> Dict[int, str]:
+        """Rendered background of each layout-map cell of one tab, keyed by pane id."""
+        cells: Dict[int, str] = {}
+        for element in self.dump(f".agent-nav-map-{tab_id} .agent-nav-cell"):
+            match = re.search(r"agent-nav-cell-(\d+)", element.get("path", ""))
+            if match:
+                cells[int(match.group(1))] = element.get("backgroundColor", "")
+        return cells
+
+    def read_prefs(self) -> Dict[str, Any]:
+        """The plugin's persisted settings, as the driven daemon stores them."""
+        if not self.kv_path or not self.kv_path.exists():
+            return {}
+        try:
+            return json.loads(self.kv_path.read_text())
+        except Exception:
+            return {}
+
     def inspect_sdk_state(self) -> Dict[str, Any]:
         self.inspect_path.unlink(missing_ok=True)
         self.ctl("plugins", "run", "plugin.agent-nav-smoke-fixture.inspect_state")
@@ -2085,6 +2153,14 @@ class SmokeRunner:
             )
 
     def test_tabs_and_sessions_exact_mapping(self):
+        # Mapping assertions below exercise the grouped display even if the
+        # caller normally keeps it off; teardown restores the original prefs.
+        self.click_element(self.visible(".agent-nav-display")[0], token="agent-nav-display")
+        switches = self.visible(".agent-nav-display-menu .agent-nav-mode-switch")
+        if "is-on" not in (switches[0].get("class") or switches[0].get("cl") or ""):
+            self.click_element(switches[0], token="agent-nav-mode-switch")
+        self.click_element(self.visible(".agent-nav-display")[0], token="agent-nav-dismiss")
+
         # In isolated self.alpha_session_name:
         # Tab 1: add first agent
         agent1 = self.create_agent("Alpha Main", how="tab")
@@ -2114,16 +2190,34 @@ class SmokeRunner:
         expected_flat = [(g, title) for g, titles in expected_groups for title in titles]
 
         def check_exact_rows():
-            rendered_rows = self.nav_rows()
-            titles = [text_content(row) for row in rendered_rows]
-            if [t for t in titles if any(exp == t for exp in [title for _, title in expected_flat])] != [title for _, title in expected_flat]:
+            expected_titles = [title for _, title in expected_flat]
+            titles = [text_content(row) for row in self.visible(".agent-nav-agent .agent-nav-title")]
+            if [title for title in titles if title in expected_titles] != expected_titles:
                 return False
-            sections = self.visible(".agent-nav-group")
-            expected_sections = [group + "".join(titles) for group, titles in expected_groups]
-            rendered_sections = [text_content(section) for section in sections]
-            return all(exp in rendered_sections for exp in expected_sections)
+            state = self.inspect_sdk_state()
+            pane_tabs = {p["pane"]: p.get("tab") for p in state["panes"]}
+            rendered_boxes = self.visible(".agent-nav-tab")
+            positions = []
+            for session_name, session_titles in expected_groups:
+                session = next(s for s in state["sessions"] if s["name"] == session_name)
+                for tab_id in session["tabs"]:
+                    own_titles = [title for title in session_titles if pane_tabs.get(self.agent_panes[title]) == tab_id]
+                    if not own_titles:
+                        continue
+                    selector = f'.agent-nav-tab[data-tab="{tab_id}"]'
+                    boxes = self.visible(selector)
+                    if len(own_titles) == 1:
+                        pane = self.agent_panes[own_titles[0]]
+                        if boxes or self.visible(f".agent-nav-tab .agent-nav-row-{pane}"):
+                            return False
+                        continue
+                    tab_titles = [text_content(node) for node in self.visible(selector + " .agent-nav-title")]
+                    if len(boxes) != 1 or tab_titles != own_titles:
+                        return False
+                    positions.append(next(index for index, box in enumerate(rendered_boxes) if box["rect"] == boxes[0]["rect"]))
+            return positions == sorted(set(positions))
 
-        self.wait_until(check_exact_rows, "Navigator rows did not match expected groups and titles", timeout=10)
+        self.wait_until(check_exact_rows, "Navigator rows did not match expected tabs, groups and titles", timeout=10)
 
         # 3. Focus & Title preservation
         sdk_state = self.inspect_sdk_state()
@@ -2178,6 +2272,504 @@ class SmokeRunner:
         current_rows = self.visible(".agent-nav-agent.is-current")
         assert len(current_rows) == 1
         assert "Alpha Main" in text_content(current_rows[0]), f"Active row title mismatch: {current_rows[0]}"
+
+    def test_tab_groups_and_minimap(self):
+        """Tab grouping and the layout map: per-tab boxes, muted content cells, hover link.
+
+        Proves the rendered grouping against native tab order, the map geometry against the tab's
+        real content tree, the row-hover link to the exact pane cell, and both display switches
+        through real pointer clicks with their persisted state.
+        """
+        session_name = f"Tab Groups {self.run_id}"
+        self.create_session(session_name)
+        nav = self.get_nav_pane_id()
+        self.wait_until(
+            lambda: len(self.visible(".agent-nav-root")) == 1,
+            "Navigator did not mount in the tab-group session",
+        )
+
+        def open_display_menu():
+            self.click_element(self.visible(".agent-nav-display")[0], token="agent-nav-display")
+            self.wait_until(lambda: self.visible(".agent-nav-display-menu"), "Display settings menu did not open")
+            switches = self.visible(".agent-nav-display-menu .agent-nav-mode-switch")
+            assert len(switches) == 2, f"Expected grouping and map switches: {switches}"
+            return switches
+
+        def close_display_menu():
+            # The fixed dismiss layer is hit-testable only inside the canvas.
+            # The header button's location lies inside that layer, above the menu.
+            assert self.visible(".agent-nav-dismiss"), "Open display menu has no dismiss surface"
+            self.click_element(self.visible(".agent-nav-display")[0], token="agent-nav-dismiss")
+            self.wait_until(lambda: not self.visible(".agent-nav-display-menu"), "Display menu did not close")
+
+        # Display settings persist across runs, so start from both switches on.
+        switches = open_display_menu()
+        if "is-on" not in (switches[0].get("class") or switches[0].get("cl") or ""):
+            self.click_element(switches[0], token="agent-nav-mode-switch")
+            switches = self.visible(".agent-nav-display-menu .agent-nav-mode-switch")
+        if "is-on" not in (switches[1].get("class") or switches[1].get("cl") or ""):
+            self.click_element(switches[1], token="agent-nav-mode-switch")
+        close_display_menu()
+
+        # Tab 1: two agent rows plus plain content, which still occupies a map cell.
+        agent = self.create_agent("Groups Agent", how="tab")
+        tab1 = self.inspect_sdk_state()["current_tab"]
+        self.ctl("rename", "API 重构")
+        tab_info = next(tab for tab in self.inspect_sdk_state()["tabs"] if tab["id"] == tab1)
+        assert tab_info.get("name") == "API 重构", f"Tab rename lost its Unicode label: {tab_info}"
+        assert not self.visible(f'.agent-nav-tab[data-tab="{tab1}"]'), "A single session must be an ordinary row"
+        peer = self.create_agent("Groups Peer", how="split")
+        self.ctl("plugins", "run", "plugin.agent-nav-smoke-fixture.split_content_right")
+        self.ctl("wait", "200")
+
+        # Tab 2: a fresh tab whose only content is one agent.
+        second = self.create_agent("Groups Second", how="tab")
+        tab2 = self.inspect_sdk_state()["current_tab"]
+        assert second != agent and tab2 != tab1, "Second agent did not open its own tab"
+
+        def tab1_panes():
+            state = self.inspect_sdk_state()
+            panes = [p for p in state["panes"] if p.get("tab") == tab1]
+            return panes if len(panes) == 3 else None
+
+        panes = self.wait_until(tab1_panes, "Plain content split did not land in the first tab")
+        plain = next(p["pane"] for p in panes if p["pane"] not in (agent, peer))
+        assert plain != nav, "Content split must not be the navigator"
+
+        def tab_label(tab_id: int, fallback: str) -> str:
+            state = self.inspect_sdk_state()
+            info = next((t for t in state["tabs"] if t["id"] == tab_id), None)
+            if not info:
+                return fallback
+            label = (info.get("name") or "").strip() or (info.get("title") or "").strip()
+            return label if label and label != "Agent Navigations" else fallback
+
+        def box_for(title: str) -> Dict[str, Any]:
+            matches = [node for node in self.visible(".agent-nav-tab") if title in text_content(node)]
+            assert len(matches) == 1, f"Expected exactly one tab box holding {title}: {matches}"
+            return matches[0]
+
+        def rendered_boxes():
+            boxes = self.visible(f'.agent-nav-tab[data-tab="{tab1}"]')
+            singles = self.visible(f".agent-nav-row-{second}")
+            if len(boxes) != 1 or len(singles) != 1 or self.visible(f'.agent-nav-tab[data-tab="{tab2}"]'):
+                return None
+            box = boxes[0]["rect"]
+            return boxes if singles[0]["rect"][1] >= box[1] + box[3] else None
+
+        boxes = self.wait_until(rendered_boxes, "Two-agent tab must have a box followed by an ungrouped single-agent row")
+
+        def labels_match():
+            for tab_id, rows_text in ((tab1, "Groups Agent"),):
+                names = self.visible(f'.agent-nav-tab[data-tab="{tab_id}"] .agent-nav-tab-name')
+                if len(names) != 1 or text_content(names[0]) != tab_label(tab_id, rows_text):
+                    return False
+            return True
+
+        self.wait_until(labels_match, "Tab box labels do not match the native tab names or focused titles")
+
+        def row_rect(pane: int) -> Tuple[float, float, float, float]:
+            nodes = self.visible(f".agent-nav-row-{pane}")
+            assert len(nodes) == 1, f"Expected exactly one row for pane {pane}: {nodes}"
+            return tuple(float(v) for v in nodes[0]["rect"])
+
+        for title in ("Groups Agent", "Groups Peer"):
+            bx, by, bw, bh = (float(v) for v in box_for(title)["rect"])
+            rx, ry, rw, rh = row_rect(self.agent_panes[title])
+            assert bx - 1 <= rx and rx + rw <= bx + bw + 1, f"Row {title} escaped its tab box: {rx, rw} vs {bx, bw}"
+            assert by - 1 <= ry and ry + rh <= by + bh + 1, f"Row {title} escaped its tab box: {ry, rh} vs {by, bh}"
+
+        # The tab name's text starts at the row logos' left edge (4px of its own padding).
+        first_box = box_for("Groups Agent")
+        bx, by, bw, bh = (float(v) for v in first_box["rect"])
+        names = [
+            node for node in self.visible(".agent-nav-tab-name")
+            if bx - 1 <= node["rect"][0] <= bx + bw + 1 and by - 1 <= node["rect"][1] <= by + bh + 1
+        ]
+        # A fixture harness has no known logo, so its badge is the 16px avatar:
+        # both occupy the same slot at the row's left padding.
+        badges = [
+            node
+            for node in (
+                self.visible(".agent-nav-agent .agent-nav-logo")
+                + self.visible(".agent-nav-agent .agent-nav-avatar")
+            )
+            if bx - 1 <= node["rect"][0] <= bx + bw + 1 and by - 1 <= node["rect"][1] <= by + bh + 1
+        ]
+        assert len(names) == 1 and badges, f"Expected one tab name and a row badge in the box: {names} {badges}"
+        name_x = float(names[0]["rect"][0]) + 4.0
+        badge_x = min(float(node["rect"][0]) for node in badges)
+        assert abs(name_x - badge_x) <= 2.0, (
+            f"Tab name text ({name_x}) is not aligned with the row badge left edge ({badge_x})"
+        )
+
+        # Multiple agent rows share one map; a single-row tab needs no map.
+        assert len(self.visible(f".agent-nav-map-{tab1}")) == 1, "Two-agent tab has no layout map"
+        assert not self.visible(f".agent-nav-map-{tab2}"), "Single-agent tab must not show a map"
+        assert not self.visible(f".agent-nav-row-{plain}"), "Non-agent content must not get a row"
+
+        def cell_rects(tab_id: int) -> Dict[int, Tuple[float, float, float, float]]:
+            out: Dict[int, Tuple[float, float, float, float]] = {}
+            for element in self.dump(f".agent-nav-map-{tab_id} .agent-nav-cell"):
+                match = re.search(r"agent-nav-cell-(\d+)", element.get("path", ""))
+                if match:
+                    out[int(match.group(1))] = tuple(float(v) for v in element["rect"])
+            return out
+
+        cells = cell_rects(tab1)
+        assert set(cells) == {agent, peer, plain}, f"Map cells do not cover the tab's content: {cells}"
+        muted_paths = [e.get("path", "") for e in self.dump(f".agent-nav-map-{tab1} .agent-nav-cell")]
+        assert any("is-muted" in path and f"agent-nav-cell-{plain}" in path for path in muted_paths), (
+            f"Plain content cell is not muted: {muted_paths}"
+        )
+
+        def ratio_cells(tree, x=0.0, y=0.0, w=1.0, h=1.0, out=None):
+            out = {} if out is None else out
+            if "pane" in tree:
+                out[tree["pane"]] = (x, y, w, h)
+                return out
+            ratio = float(tree.get("ratio", 0.5))
+            first = tree.get("first") or tree.get("1")
+            second = tree.get("second") or tree.get("2")
+            if tree.get("split") == "down":
+                ratio_cells(first, x, y, w, h * ratio, out)
+                ratio_cells(second, x, y + h * ratio, w, h * (1 - ratio), out)
+            else:
+                ratio_cells(first, x, y, w * ratio, h, out)
+                ratio_cells(second, x + w * ratio, y, w * (1 - ratio), h, out)
+            return out
+
+        content = project_content_tree(self.inspect_sdk_state()["layouts"][str(tab1)]["root"], nav)
+        assert content, "First tab has no content tree to compare the map against"
+        expected_cells = ratio_cells(content)
+        mx, my, mw, mh = (float(v) for v in self.visible(f".agent-nav-map-{tab1}")[0]["rect"])
+        first_row, peer_row = row_rect(agent), row_rect(peer)
+        assert mx + mw <= first_row[0] + first_row[2], "Floating map escaped the session row width"
+        assert abs(my - first_row[1]) <= 1 and my + mh <= peer_row[1] + peer_row[3], (
+            f"Map must fit alongside two rows: map={(mx, my, mw, mh)}, rows={first_row, peer_row}"
+        )
+        assert by + bh - (peer_row[1] + peer_row[3]) <= 10, "Map added an extra row below the sessions"
+        assert set(expected_cells) == set(cells), f"Map cells do not match the content tree: {cells} vs {expected_cells}"
+        for pane, (ex, ey, ew, eh) in expected_cells.items():
+            rx, ry, rw, rh = cells[pane]
+            assert abs((rx - mx) - ex * mw) <= 2.0, f"Cell {pane} left differs from ratio {ex}: {rx - mx}"
+            assert abs((ry - my) - ey * mh) <= 2.0, f"Cell {pane} top differs from ratio {ey}: {ry - my}"
+            assert abs(rw - ew * mw) <= 2.0, f"Cell {pane} width differs from ratio {ew}: {rw}"
+            assert abs(rh - eh * mh) <= 2.0, f"Cell {pane} height differs from ratio {eh}: {rh}"
+
+        # The highlight is projected from its row over the shared map. Its visible
+        # rectangle must match exactly one native pane, without changing row fill.
+        def lit_indicators():
+            result = {}
+            for element in self.dump(".agent-nav-map-indicator"):
+                match = re.search(r"agent-nav-indicator-(\d+)", element.get("path", ""))
+                if match and float(element.get("opacity", "0")) > 0.5:
+                    result[int(match.group(1))] = element
+            return result
+
+        self.ctl("move", "0", "0")
+        self.wait_until(lambda: not lit_indicators(), "A map cell is lit before hover")
+        base = self.map_cell_backgrounds(tab1)
+        rx, ry, rw, rh = row_rect(agent)
+        self.ctl("move", str(round(rx + rw / 2)), str(round(ry + rh / 2)))
+        def brightened():
+            lit = lit_indicators()
+            return lit if set(lit) == {agent} and bg_alpha(lit[agent]["backgroundColor"]) > bg_alpha(base[agent]) else None
+
+        hovered = self.wait_until(brightened, "Hovering the row did not brighten its pane cell")
+        assert set(hovered) == {agent}, f"Hover lit the wrong panes: {hovered}"
+        indicator = hovered[agent]
+        assert all(abs(a - b) <= 1 for a, b in zip(indicator["rect"], cells[agent])), (
+            f"Hover indicator misses the pane rectangle: {indicator['rect']} vs {cells[agent]}"
+        )
+        assert bg_alpha(indicator["backgroundColor"]) > bg_alpha(base[agent]), "Hover must brighten the cell"
+        assert self.map_cell_backgrounds(tab1) == base, "Hover changed another pane's base cell"
+        row_bg = self.dump(f".agent-nav-row-{agent}")[0]["backgroundColor"]
+        assert is_transparent_bg(row_bg), f"Hover must not fill the row: {row_bg}"
+        self.save_screenshot("tab-groups-hover")
+        if self.artifacts_dir:
+            (self.artifacts_dir / "tab-map-geometry.json").write_text(json.dumps({
+                "native": expected_cells, "rendered": cells, "hover_before": base, "hover_after": hovered,
+                "legend_text_x": name_x, "logo_x": badge_x,
+            }, indent=2))
+
+        self.ctl("move", "0", "0")
+        self.wait_until(
+            lambda: not lit_indicators(),
+            "Map cell stayed lit after the pointer left the row",
+        )
+        map_selector = f".agent-nav-map-{tab1}"
+        self.wait_until(lambda: float(self.dump(map_selector)[0]["opacity"]) == 0, "Ghost map stayed visible after leaving the group")
+        assert is_transparent_bg(self.dump(map_selector)[0]["backgroundColor"]), "Ghost map must have no backing surface"
+        for pane in (agent, peer):
+            rx, ry, rw, rh = row_rect(pane)
+            self.ctl("move", str(round(rx + rw / 2)), str(round(ry + rh / 2)))
+            self.wait_until(lambda: float(self.dump(map_selector)[0]["opacity"]) == 1, "Ghost map did not appear on group hover")
+            self.wait_until(lambda: set(lit_indicators()) == {pane}, "Hover highlighted a different session's pane")
+        self.ctl("move", "0", "0")
+
+        # Display settings: grouping off, then the map, through real clicks.
+        switches = open_display_menu()
+        self.click_element(switches[0], token="agent-nav-mode-switch")
+        self.wait_until(lambda: not self.visible(".agent-nav-tab"), "Turning grouping off did not flatten the list")
+        assert not self.visible(".agent-nav-map"), "Layout map must hide while grouping is off"
+        prefs = self.read_prefs()
+        assert prefs.get("agent_nav.group_tabs") is False, f"Grouping preference not persisted: {prefs}"
+        assert prefs.get("agent_nav.minimap", True) is True, f"Grouping must not clear the map preference: {prefs}"
+
+        switches = self.visible(".agent-nav-display-menu .agent-nav-mode-switch")
+        map_switch = switches[1]
+        assert "is-disabled" in (map_switch.get("class") or map_switch.get("cl") or ""), (
+            f"Map switch must be disabled while grouping is off: {map_switch}"
+        )
+        notes = self.visible(".agent-nav-display-menu .agent-nav-mode-note")
+        assert notes and "grouping" in text_content(notes[0]).lower(), f"Disabled map switch lacks its reason: {notes}"
+        self.click_element(map_switch)
+        assert self.read_prefs().get("agent_nav.minimap", True) is True, "A disabled map switch changed its preference"
+
+        switches = self.visible(".agent-nav-display-menu .agent-nav-mode-switch")
+        self.click_element(switches[0], token="agent-nav-mode-switch")
+        self.wait_until(lambda: self.visible(".agent-nav-tab"), "Turning grouping on did not restore tab boxes")
+        self.wait_until(lambda: self.visible(f".agent-nav-map-{tab1}"), "Map preference was not restored with grouping")
+
+        switches = self.visible(".agent-nav-display-menu .agent-nav-mode-switch")
+        self.click_element(switches[1], token="agent-nav-mode-switch")
+        self.wait_until(lambda: not self.visible(".agent-nav-map"), "Turning the map off did not hide it")
+        assert self.visible(".agent-nav-tab"), "Grouping must survive the map switch"
+        assert self.read_prefs().get("agent_nav.minimap") is False, "Map preference was not persisted"
+
+        switches = self.visible(".agent-nav-display-menu .agent-nav-mode-switch")
+        self.click_element(switches[1], token="agent-nav-mode-switch")
+        self.wait_until(lambda: self.visible(".agent-nav-map"), "Map did not come back on")
+        close_display_menu()
+        prefs = self.read_prefs()
+        assert prefs.get("agent_nav.group_tabs", True) is True and prefs.get("agent_nav.minimap", True) is True, prefs
+
+        self.close_owned_pane(peer, user_path=False)
+        self.wait_until(lambda: not self.visible(f'.agent-nav-tab[data-tab="{tab1}"]'), "Removing the second session did not remove its group outline")
+        assert len(self.visible(f".agent-nav-row-{agent}")) == 1, "Remaining session row disappeared with the group"
+        assert not self.visible(f".agent-nav-map-{tab1}"), "Single session retained a map after its peer closed"
+
+        # Leave the run in its usual place.
+        self.switch_session(self.alpha_session_name)
+        self.close_session(session_name)
+        self.fixture_sessions.discard(session_name)
+        self.wait_until(self.is_singleton, "Navigator did not settle after the tab-group run")
+
+    def test_spatial_order_and_map_motion(self):
+        """Reorder native tabs/blocks and observe row order and map geometry in the live GUI."""
+        session_name = f"Spatial Order {self.run_id}"
+        self.create_session(session_name)
+
+        def display(grouped, mapped=None):
+            self.click_element(self.visible(".agent-nav-display")[0], token="agent-nav-display")
+            for index, enabled in enumerate((grouped, mapped)):
+                if enabled is None:
+                    continue
+                switches = self.visible(".agent-nav-display-menu .agent-nav-mode-switch")
+                assert len(switches) == 2, switches
+                on = "is-on" in (switches[index].get("class") or switches[index].get("cl") or "")
+                if on != enabled:
+                    self.click_element(switches[index], token="agent-nav-mode-switch")
+            self.click_element(self.visible(".agent-nav-display")[0], token="agent-nav-dismiss")
+
+        def arrange(command, **spec):
+            self.ack_path.unlink(missing_ok=True)
+            self.target_file.write_text(json.dumps(spec))
+            self.ctl("plugins", "run", f"plugin.agent-nav-smoke-fixture.{command}")
+            self.wait_until(lambda: self.ack_path.exists(), f"{command} did not acknowledge its layout change")
+            assert json.loads(self.ack_path.read_text())["op"] == command
+
+        display(True, True)
+        a = self.create_agent("Spatial A", how="tab")
+        first_tab = self.inspect_sdk_state()["current_tab"]
+        b = self.create_agent("Spatial B", how="split")
+        c = self.create_agent("Spatial C", how="split")
+        arrange("position_fixture", pane=c, target=a, dir="right")
+        arrange("position_fixture", pane=a, target=c, dir="down")
+        # C above A on the left, B on the right: reading order differs from
+        # both creation order (A,B,C) and depth-first traversal (C,A,B).
+        d = self.create_agent("Spatial D", how="tab")
+        second_tab = self.inspect_sdk_state()["current_tab"]
+        arrange("order_fixture_tab", pane=d, position=1)
+        native_tabs = [tab["id"] for tab in self.inspect_sdk_state()["tabs"]]
+        assert native_tabs.index(second_tab) < native_tabs.index(first_tab), native_tabs
+
+        def row_order():
+            positions = {}
+            for pane in (a, b, c, d):
+                nodes = self.visible(f".agent-nav-row-{pane}")
+                if len(nodes) != 1:
+                    return []
+                positions[pane] = nodes[0]["rect"][1]
+            return sorted(positions, key=positions.get)
+
+        expected = [d, c, b, a]
+        self.wait_until(lambda: row_order() == expected, "Rows ignored native tab/spatial block order")
+        display(False)
+        self.wait_until(lambda: row_order() == expected, "Flat rows lost native tab/spatial block order")
+        display(True)
+        self.wait_until(lambda: row_order() == expected, "Grouped rows lost native tab/spatial block order")
+
+        def map_geometry():
+            maps = self.visible(f".agent-nav-map-{first_tab}")
+            if len(maps) != 1:
+                return None
+            mx, my, mw, mh = maps[0]["rect"]
+            cells = {}
+            for pane in (a, b, c):
+                nodes = self.visible(f".agent-nav-cell-{pane}")
+                if len(nodes) != 1:
+                    return None
+                x, y, w, h = nodes[0]["rect"]
+                cells[pane] = (x - mx, y - my, w, h)
+            return {"size": (mw, mh), "cells": cells}
+
+        baseline = self.wait_until(map_geometry, "Spatial map did not render")
+        samples = []
+        for focused in (c, d, c, d):
+            self.focus_pane(focused)
+            self.wait_until(self.is_singleton, "Navigator did not follow the focused tab")
+            previous = 0
+            for elapsed in (0, 40, 100, 160):
+                if elapsed:
+                    self.ctl("wait", str(elapsed - previous))
+                previous = elapsed
+                geometry = self.wait_until(map_geometry, "Tab switching removed the spatial map")
+                assert geometry["size"] == baseline["size"], geometry
+                for pane, rect in geometry["cells"].items():
+                    assert all(abs(v - old) <= 1 for v, old in zip(rect, baseline["cells"][pane])), (
+                        f"Tab switch moved/resized cell {pane}: {baseline} -> {geometry}"
+                    )
+                samples.append({"focused": focused, "sample": elapsed, "geometry": geometry})
+        if self.artifacts_dir:
+            (self.artifacts_dir / "spatial-order-motion.json").write_text(json.dumps({
+                "native_tabs": native_tabs, "expected_rows": expected, "rendered_rows": row_order(),
+                "samples": samples,
+            }, indent=2))
+        self.save_screenshot("spatial-order-motion")
+        self.switch_session(self.alpha_session_name)
+        self.close_session(session_name)
+        self.fixture_sessions.discard(session_name)
+        self.wait_until(self.is_singleton, "Navigator did not settle after spatial-order cleanup")
+
+    def test_map_click_position_and_spacing(self):
+        """Native press/release projection, selected-half map placement and mixed row gaps."""
+        session_name = f"Map Click {self.run_id}"
+        self.create_session(session_name)
+
+        def display(grouped):
+            self.click_element(self.visible(".agent-nav-display")[0], token="agent-nav-display")
+            for index, enabled in enumerate((grouped, True)):
+                switches = self.visible(".agent-nav-display-menu .agent-nav-mode-switch")
+                if index == 1 and not grouped:
+                    continue
+                on = "is-on" in (switches[index].get("class") or switches[index].get("cl") or "")
+                if on != enabled:
+                    self.click_element(switches[index], token="agent-nav-mode-switch")
+            self.click_element(self.visible(".agent-nav-display")[0], token="agent-nav-dismiss")
+
+        display(True)
+        panes = [self.create_agent("Click A", how="tab")]
+        tab = self.inspect_sdk_state()["current_tab"]
+        panes.extend(self.create_agent(f"Click {name}", how="split") for name in ("B", "C", "D"))
+        second = self.create_agent("Click Next A", how="tab")
+        tab2 = self.inspect_sdk_state()["current_tab"]
+        second_peer = self.create_agent("Click Next B", how="split")
+        single = self.create_agent("Click Single A", how="tab")
+        single_peer = self.create_agent("Click Single B", how="tab")
+        third = self.create_agent("Click Last A", how="tab")
+        tab3 = self.inspect_sdk_state()["current_tab"]
+        third_peer = self.create_agent("Click Last B", how="split")
+
+        def rect(selector):
+            nodes = self.wait_until(lambda: self.visible(selector), f"Missing {selector}")
+            assert len(nodes) == 1, nodes
+            return nodes[0]["rect"]
+
+        def row_rect(pane):
+            return rect(f".agent-nav-row-{pane}")
+
+        boxes = [rect(f'.agent-nav-tab[data-tab="{t}"]') for t in (tab, tab2, tab3)]
+        singles = [row_rect(p) for p in (single, single_peer)]
+        compact = singles[1][1] - singles[0][1] - singles[0][3]
+        gaps = [boxes[1][1] - boxes[0][1] - boxes[0][3],
+                singles[0][1] - boxes[1][1] - boxes[1][3],
+                boxes[2][1] - singles[1][1] - singles[1][3]]
+        assert abs(compact) <= 1, f"Ordinary rows gained a group gap: {compact}"
+        assert min(gaps) > compact + 1 and max(gaps) - min(gaps) <= 1, gaps
+
+        def projection(pane):
+            row = self.dump(f".agent-nav-row-{pane}")[0]
+            cell = self.dump(f".agent-nav-cell-{pane}")[0]
+
+            def only_target_lit():
+                lit = [node for node in self.dump(".agent-nav-map-indicator")
+                       if float(node.get("opacity", "0")) > 0
+                       and bg_alpha(node.get("backgroundColor", "transparent")) > 0]
+                if len(lit) != 1 or not re.search(rf"\bagent-nav-indicator-{pane}\b", lit[0].get("path", "")):
+                    return None
+                return lit[0] if bg_alpha(lit[0]["backgroundColor"]) > bg_alpha(cell["backgroundColor"]) else None
+
+            indicator = self.wait_until(only_target_lit, f"Only pane {pane}'s map highlight must be visible")
+            cell = self.dump(f".agent-nav-cell-{pane}")[0]
+            assert row["transform"] == "none", f"Row press transformed the projection: {row}"
+            assert all(abs(a - b) <= 1 for a, b in zip(indicator["rect"], cell["rect"])), (
+                f"Highlight escaped its map cell: {indicator} vs {cell}"
+            )
+            return {"row": row["rect"], "indicator": indicator["rect"], "cell": cell["rect"],
+                    "opacity": indicator["opacity"], "background": indicator["backgroundColor"]}
+
+        def corner(tab_id, bottom):
+            body = rect(f'.agent-nav-tab[data-tab="{tab_id}"] .agent-nav-tab-body')
+            mapped = rect(f".agent-nav-map-{tab_id}")
+            top_gap = mapped[1] - body[1]
+            bottom_gap = body[1] + body[3] - mapped[1] - mapped[3]
+            assert (bottom_gap < top_gap) == bottom, (bottom, body, mapped)
+            assert min(top_gap, bottom_gap) >= 0, (body, mapped)
+            return mapped
+
+        ordered = sorted(panes, key=lambda p: row_rect(p)[1])
+        samples = []
+        for index, pane in enumerate(ordered, 1):
+            x, y, w, h = row_rect(pane)
+            self.ctl("move", str(round(x + w / 2)), str(round(y + h / 2)))
+            before = projection(pane)
+            before_map = rect(f".agent-nav-map-{tab}")
+            self.ctl("down", str(round(x + w / 2)), str(round(y + h / 2)))
+            try:
+                pressed = projection(pane)
+                assert pressed["row"] == before["row"], (before, pressed)
+                assert rect(f".agent-nav-map-{tab}") == before_map, "Press temporarily changed the selected block's map corner"
+            finally:
+                self.ctl("up")
+            self.wait_until(lambda: self.inspect_sdk_state()["focused"] == pane, "Row click lost native focus")
+            mapped = corner(tab, index * 2 <= len(ordered))
+            for delay in (0, 40, 100):
+                if delay:
+                    self.ctl("wait", str(delay))
+                samples.append({"pane": pane, "phase": delay, "projection": projection(pane)})
+                assert rect(f".agent-nav-map-{tab}") == mapped, "Click animated map placement"
+        # A hovered group without the selected block always uses the upper corner.
+        x, y, w, h = row_rect(second)
+        self.ctl("move", str(round(x + w / 2)), str(round(y + h / 2)))
+        corner(tab2, False)
+        projection(second)
+
+        all_panes = panes + [second, second_peer, single, single_peer, third, third_peer]
+        display(False)
+        flat = sorted((row_rect(p) for p in all_panes), key=lambda r: r[1])
+        assert all(abs(b[1] - a[1] - a[3]) <= 1 for a, b in zip(flat, flat[1:])), flat
+        display(True)
+        if self.artifacts_dir:
+            (self.artifacts_dir / "map-click-position-spacing.json").write_text(json.dumps({
+                "compact_gap": compact, "group_gaps": gaps, "samples": samples,
+            }, indent=2))
+        self.save_screenshot("map-click-position-spacing")
+        self.switch_session(self.alpha_session_name)
+        self.close_session(session_name)
+        self.fixture_sessions.discard(session_name)
+        self.wait_until(self.is_singleton, "Navigator did not settle after map-click cleanup")
 
     def test_split_content_preservation(self):
         nav = self.get_nav_pane_id()
@@ -2301,12 +2893,12 @@ class SmokeRunner:
         focus(first)
 
         # Tab round trip
-        origin = next(t for t in settled["tabs"] if t["id"] == origin_tab)
         other_tab = next(t for t in settled["tabs"] if t["session"] == origin_session and t["id"] != origin_tab)
-        self.ctl("tab", str(other_tab["position"]))
+        other_pane = next(p["pane"] for p in settled["panes"] if p.get("tab") == other_tab["id"] and p["pane"] != nav)
+        focus(other_pane)
         self.wait_until(self.is_singleton, "Navigator did not follow another tab")
         self.wait_visible_ratio(self.baseline_ratio, "Navigator altered ratio following another tab")
-        self.ctl("tab", str(origin["position"]))
+        focus(first)
         self.wait_until(preserved, "Tab round trip changed mixed content")
         self.wait_visible_ratio(self.baseline_ratio, "Tab round trip altered navigator ratio")
 
@@ -2517,13 +3109,16 @@ class SmokeRunner:
                         bg = el["backgroundColor"]
 
                         if is_cur:
-                            assert is_faint_neutral_grey_bg(bg), (
+                            assert not is_transparent_bg(bg), (
                                 f"Current agent row (status={expected_status}, focus_target={f_target}, interaction={inter}) "
-                                f"must have a faint neutral grey background, got '{bg}'"
+                                f"must visibly distinguish the focused row, got '{bg}'"
                             )
                             if focused_background is None:
                                 focused_background = bg
-                            assert bg == focused_background, "Focused row background changed with agent state or interaction"
+                            assert bg == focused_background, (
+                                f"Focused background changed {focused_background!r} -> {bg!r}; "
+                                f"status={expected_status}, target={f_target}, interaction={inter}, path={el['path']}"
+                            )
                         else:
                             assert is_transparent_bg(bg), (
                                 f"Non-current agent row (status={expected_status}, focus_target={f_target}, interaction={inter}) "
@@ -2810,6 +3405,9 @@ class SmokeRunner:
         self.test_real_pointer_click_jump()
         if self.click_only:
             return False
+        self.test_tab_groups_and_minimap()
+        self.test_spatial_order_and_map_motion()
+        self.test_map_click_position_and_spacing()
         self.test_split_content_preservation()
         self.test_manual_close_disables()
         self.test_parent_tab_close_recreates()
@@ -2857,6 +3455,13 @@ def main():
         type=Path,
         default=root,
         help="Path to tern-agent-nav plugin package. If different from currently linked source, links it for testing and restores original source in teardown.",
+    )
+    parser.add_argument(
+        "--control",
+        help=(
+            "Control socket of the window under test. Every ctl command routes through it, so an "
+            "isolated sandbox window is driven instead of the default production endpoint."
+        ),
     )
     parser.add_argument("--artifacts", type=Path, help="Directory to save screenshots, dumps, and logs")
     parser.add_argument(

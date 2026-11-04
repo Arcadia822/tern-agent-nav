@@ -28,6 +28,9 @@ local KV_SHARE = "agent_nav.share"
 local KV_LAUNCH_UI = "agent_nav.launch_ui"
 local KV_OPEN_TAB = "agent_nav.open_in_tab"
 
+-- Display preferences. Both default on, so only an explicit `false` turns them off.
+local KV_GROUP_TABS = "agent_nav.group_tabs"
+local KV_MINIMAP = "agent_nav.minimap"
 -- Clean up settings from obsolete layouts.
 for _, key in { "agent_nav.width", "agent_nav.auto_tabs", "agent_nav.omp_debug", "agent_nav.panes_dump", "agent_nav.test_ping" } do
 	if tern.kv.get(key) ~= nil then
@@ -70,6 +73,7 @@ type Badge = { kind: "icon", name: string } | { kind: "letter", text: string }
 type AgentRow = {
 	pane: number,
 	session: number,
+	tab: number?,
 	title: string,
 	badge: Badge,
 	status: string,
@@ -102,6 +106,17 @@ end
 local function storedShare(): number
 	local v = tonumber(tern.kv.get(KV_SHARE))
 	return if v then clampShare(v) else DEFAULT_SHARE
+end
+
+-- Display preferences are read from the window-wide settings store on every
+-- render, so a second window's switch is not cached out of date here. Both
+-- default on: only an explicit `false` turns one off.
+local function group_tabs(): boolean
+	return tern.kv.get(KV_GROUP_TABS) ~= false
+end
+
+local function show_map(): boolean
+	return tern.kv.get(KV_MINIMAP) ~= false
 end
 
 --------------------------------------------------------------------------------
@@ -1792,6 +1807,8 @@ local screenBudget = 0
 -- The open harness menu; its items are built when it opens, so rendering never
 -- reads settings or the filesystem.
 local menu: Menu? = nil
+-- The display settings menu: global to the rail, so it never carries a session.
+local displayMenu: boolean = false
 
 local function slot(cx: WindowCx): number?
 	if slotPane and not cx.session:pane(slotPane) then
@@ -2214,6 +2231,7 @@ local function toggle_menu(cx: WindowCx, session: number): boolean
 		menu = nil
 	else
 		menu = { session = session, items = build_harnesses(cx) }
+		displayMenu = false
 	end
 	return true
 end
@@ -2243,6 +2261,7 @@ local ACTIONS: { [string]: Action } = {
 				return false
 			end
 			menu = nil
+			displayMenu = false
 			cx.sessions:switch(session)
 			cx.layout:focus(pane)
 			return true
@@ -2265,6 +2284,37 @@ local ACTIONS: { [string]: Action } = {
 		run = function()
 			menu = nil
 			return true
+		end,
+	},
+	-- A display setting always acts on the live rail, never on a session.
+	display = {
+		pattern = "^(%a+)$",
+		run = function(_cx, _session, value)
+			if value == "toggle" then
+				displayMenu = not displayMenu
+				if displayMenu then
+					menu = nil
+				end
+				return true
+			end
+			if value == "dismiss" then
+				displayMenu = false
+				menu = nil
+				return true
+			end
+			if value == "tabs" then
+				tern.kv.set(KV_GROUP_TABS, not group_tabs())
+				return true
+			end
+			if value == "map" then
+				-- Grouping is what the map measures, so the switch stays off with it.
+				if not group_tabs() then
+					return false
+				end
+				tern.kv.set(KV_MINIMAP, not show_map())
+				return true
+			end
+			return false
 		end,
 	},
 	mode = {
@@ -2307,7 +2357,8 @@ local ACTIONS: { [string]: Action } = {
 }
 
 -- Route one canvas click; false when it is not ours, so the caller keeps its own
--- fallback.
+-- fallback. Display keys carry no session, so they are matched apart from the
+-- session-scoped actions.
 local function dispatch(cx: WindowCx, act: string): boolean
 	local verb, rest = string.match(act, "^(%a+):(.*)$")
 	if not verb or not rest then
@@ -2317,8 +2368,11 @@ local function dispatch(cx: WindowCx, act: string): boolean
 	if not action then
 		return false
 	end
-	local session, arg = string.match(rest, action.pattern)
-	local sid = tonumber(session)
+	local first, arg = string.match(rest, action.pattern)
+	if verb == "display" then
+		return if first then action.run(cx, 0, first) else false
+	end
+	local sid = tonumber(first)
 	if not sid then
 		return false
 	end
@@ -2354,15 +2408,41 @@ local function session_header(session: number, name: string): Node
 	})
 end
 
-local function switch_row(label: string, key: string, on: boolean): Node
-	return ui.el("div", { class = "agent-nav-mode" }, {
-		ui.el("span", { text = label }),
+-- A labeled switch row. A disabled switch keeps its place and states why it
+-- cannot be changed, so the setting never disappears without an explanation.
+local function switch_row(label: string, key: string, on: boolean, note: string?): Node
+	local disabled = note ~= nil
+	local label_parts: { Node } = { ui.el("span", { text = label }) }
+	if note then
+		table.insert(label_parts, ui.el("span", { class = "agent-nav-mode-note", text = note }))
+	end
+	return ui.el("div", { class = "agent-nav-mode" .. (if note then " has-note" else "") }, {
+		ui.el("span", { class = "agent-nav-mode-label" }, label_parts),
 		ui.el("button", {
-			key = key, actions = { click = key },
-			class = "agent-nav-mode-switch" .. (if on then " is-on" else ""),
-			attrs = { role = "switch", ["aria-label"] = label, ["aria-checked"] = tostring(on) },
+			key = key,
+			actions = if disabled then nil else { click = key },
+			class = "agent-nav-mode-switch" .. (if on then " is-on" else "")
+				.. (if disabled then " is-disabled" else ""),
+			attrs = {
+				role = "switch",
+				["aria-label"] = label,
+				["aria-checked"] = tostring(on),
+				["aria-disabled"] = tostring(disabled),
+				title = note or label,
+			},
 		}, { ui.el("span", { class = "agent-nav-switch-thumb" }) }),
 	})
+end
+
+-- Rail-wide display settings, separate from the per-session harness menu.
+local function display_menu_node(): Node
+	local grouped = group_tabs()
+	local rows: { Node } = {
+		switch_row("Group rows by tab", "display:tabs", grouped),
+		switch_row("Show layout map", "display:map", show_map(),
+			if grouped then nil else "Turn on tab grouping to show the layout map."),
+	}
+	return ui.el("div", { class = "agent-nav-menu agent-nav-display-menu" }, rows)
 end
 
 local function menu_node(m: Menu): Node
@@ -2529,24 +2609,298 @@ local function sample_status(cx: WindowCx)
 	sampledPanes = freshSampled
 end
 
+local function trim_text(s: string?): string
+	return string.match(s or "", "^%s*(.-)%s*$") or ""
+end
+
+-- A tab's label: the name the user gave it, else its focused pane's title, and
+-- only then a row title. The rail's own canvas title names no tab.
+local function tab_label(info: TabInfo?, rows: { AgentRow }): string
+	if info then
+		local name = trim_text(info.name)
+		if name ~= "" then
+			return name
+		end
+		local _, focused = spinnerTitle(info.title)
+		local clean = trim_text(focused)
+		if clean ~= "" and clean ~= TITLE then
+			return clean
+		end
+	end
+	if #rows > 0 then
+		return rows[1].title
+	end
+	if info then
+		return "Tab " .. tostring(info.position)
+	end
+	return "Tab"
+end
+
+-- Pane-keyed class names carry the value the generated stylesheet needs, so the
+-- map link does not depend on attribute selectors.
+local function pane_class(kind: string, pane: number): string
+	return "agent-nav-" .. kind .. "-" .. tostring(pane)
+end
+
+-- Pressing a rail row focuses the canvas before its click focuses content.
+-- Keep the last selected content block through that temporary canvas focus.
+local mapSelectedPane: number? = nil
+
+local function agent_row_node(ag: AgentRow, mapped: boolean?): Node
+	local action_key = goto_key(ag.session, ag.pane)
+	local children: { Node } = {
+		badge_node(ag.badge),
+		if ag.status == "running"
+			then ui.el("span", { class = "agent-nav-title" }, {
+				ui.node("shimmer", { mode = "classic", spans = { { t = ag.title } } }),
+			})
+			else ui.el("span", { class = "agent-nav-title", text = ag.title }),
+	}
+	if mapped then
+		-- Positioned against the tab body, over the shared map. Keeping this
+		-- inside its row lets the host's descendant-only hover CSS target it.
+		table.insert(children, ui.el("div", {
+			class = "agent-nav-map-indicator " .. pane_class("indicator", ag.pane),
+			attrs = { ["aria-hidden"] = "true", ["data-pane"] = tostring(ag.pane) },
+		}))
+	end
+	return ui.el("button", {
+		key = action_key,
+		actions = { click = action_key },
+		class = "agent-nav-agent status-" .. ag.status .. (if ag.is_current then " is-current" else "")
+			.. " " .. pane_class("row", ag.pane),
+		attrs = { title = ag.title .. " · " .. ag.status, ["data-pane"] = tostring(ag.pane) },
+	}, children)
+end
+
+-------------------------------------------------------------------------------
+-- Layout Map
+-------------------------------------------------------------------------------
+-- One compact picture of a tab's content tree. The canvas has no hover events
+-- and its CSS has no sibling or :has selectors. A row-owned highlight projects
+-- over the shared map using the tab body as its containing block. Pane geometry
+-- lives in a scoped stylesheet, replaced only when that geometry changes.
+
+type MapCell = { pane: number, x: number, y: number, w: number, h: number, floating: boolean }
+
+-- A floating block shows as a small overlay at the owner's corner; the SDK
+-- reports the owner and the corner, never the float's own geometry.
+local FLOAT_SHARE = 0.42
+
+local function flatten_cells(t: Tree, x: number, y: number, w: number, h: number, out: { MapCell })
+	local pane = t.pane
+	if pane then
+		table.insert(out, { pane = pane, x = x, y = y, w = w, h = h, floating = false })
+		return
+	end
+	local first, second = t.first, t.second
+	if not first or not second then
+		return
+	end
+	local ratio = t.ratio or 0.5
+	if t.axis == "down" then
+		flatten_cells(first, x, y, w, h * ratio, out)
+		flatten_cells(second, x, y + h * ratio, w, h * (1 - ratio), out)
+	else
+		flatten_cells(first, x, y, w * ratio, h, out)
+		flatten_cells(second, x + w * ratio, y, w * (1 - ratio), h, out)
+	end
+end
+
+local function owner_cell(cells: { MapCell }, pane: number): MapCell?
+	for _, cell in cells do
+		if cell.pane == pane then
+			return cell
+		end
+	end
+	return nil
+end
+
+local function add_float_cells(layout: TabLayout, cells: { MapCell })
+	for _, float in layout.floats do
+		local pane, over, corner = float.pane, float.over, float.corner
+		local owner = if valid_id(pane) and valid_id(over) then owner_cell(cells, over) else nil
+		if owner then
+			local w, h = owner.w * FLOAT_SHARE, owner.h * FLOAT_SHARE
+			local x = if corner == "tr" or corner == "br" then owner.x + owner.w - w else owner.x
+			local y = if corner == "bl" or corner == "br" then owner.y + owner.h - h else owner.y
+			table.insert(cells, { pane = pane, x = x, y = y, w = w, h = h, floating = true })
+		end
+	end
+end
+
+
+local function pct(v: number): string
+	return string.format("%.2f%%", math.clamp(v, 0, 1) * 100)
+end
+
+
+local function layout_cells(cx: WindowCx, tab: number): { MapCell }?
+	local layout = cx.session:layout(tab)
+	if not layout or not layout.root then
+		return nil
+	end
+	-- The rail lives in the shown tab; it is furniture, not content.
+	local root: any = layout.root
+	if slotPane then
+		root = strip_native_pane(root, slotPane)
+	end
+	local content = if root then tree_of(root) else nil
+	if not content then
+		return nil
+	end
+	local cells: { MapCell } = {}
+	flatten_cells(content, 0, 0, 1, 1, cells)
+	add_float_cells(layout, cells)
+	return cells
+end
+
+local function sort_rows(rows: { AgentRow }, cells: { MapCell }?)
+	if #rows < 2 then
+		return
+	end
+	local positions: { [number]: MapCell } = {}
+	if cells then
+		for _, cell in cells do
+			positions[cell.pane] = cell
+		end
+	end
+	table.sort(rows, function(a: AgentRow, b: AgentRow): boolean
+		local pa, pb = positions[a.pane], positions[b.pane]
+		local ay, by = if pa then pa.y else math.huge, if pb then pb.y else math.huge
+		if ay ~= by then
+			return ay < by
+		end
+		local ax, bx = if pa then pa.x else math.huge, if pb then pb.x else math.huge
+		return if ax ~= bx then ax < bx else a.pane < b.pane
+	end)
+end
+
+local function map_node(tab: number, rows: { AgentRow }, cells: { MapCell }, css: { string }, bottom: boolean): Node
+	local row_panes: { [number]: boolean } = {}
+	for _, ag in rows do
+		row_panes[ag.pane] = true
+	end
+	local children: { Node } = {}
+	for _, cell in cells do
+		local pane, cls = cell.pane, pane_class("cell", cell.pane)
+		table.insert(css, string.format(
+			".agent-nav-root .%s { left: calc(%s + 1px); top: calc(%s + 1px); width: calc(%s - 2px); height: calc(%s - 2px); }",
+			cls, pct(cell.x), pct(cell.y), pct(cell.w), pct(cell.h)))
+		if row_panes[pane] then
+			table.insert(css, string.format(
+				".agent-nav-root .%s { right: %.4fpx; %s: %.4fpx; width: %.4fpx; height: %.4fpx; }",
+				pane_class("indicator", pane), 9 + (1 - cell.x - cell.w) * 48,
+				if bottom then "bottom" else "top",
+				5 + (if bottom then 1 - cell.y - cell.h else cell.y) * 32,
+				math.max(0, cell.w * 48 - 2), math.max(0, cell.h * 32 - 2)))
+		end
+		table.insert(children, ui.el("div", {
+			key = "map-cell:" .. tostring(pane),
+			class = "agent-nav-cell " .. cls
+				.. (if cell.floating then " is-float" else "")
+				.. (if row_panes[pane] then "" else " is-muted"),
+			attrs = { ["data-pane"] = tostring(pane) },
+		}))
+	end
+	return ui.el("div", {
+		key = "map:" .. tostring(tab),
+		class = "agent-nav-map agent-nav-map-" .. tostring(tab) .. (if bottom then " is-bottom" else ""),
+		attrs = { ["aria-hidden"] = "true", ["data-tab"] = tostring(tab) },
+	}, children)
+end
+
+local installed_css: string? = nil
+local function install_map_css(css: string)
+	-- An empty sheet still replaces the previous one; a comment keeps the call
+	-- valid while the map is off or shows nothing.
+	local sheet = if css == "" then "/* no layout map cells */" else css
+	if sheet == installed_css then
+		return
+	end
+	tern.css("agent-nav-geometry", sheet)
+	installed_css = sheet
+end
+
+local function tab_box(tab: number, rows: { AgentRow }, info: TabInfo?, mapped: boolean, cells: { MapCell }?, css: { string }): Node
+	local label = tab_label(info, rows)
+	local bottom = false
+	for index, ag in rows do
+		if ag.pane == mapSelectedPane then
+			bottom = index * 2 <= #rows
+			break
+		end
+	end
+	local map = if mapped and cells then map_node(tab, rows, cells, css, bottom) else nil
+	local body: { Node } = {}
+	for _, ag in rows do
+		table.insert(body, agent_row_node(ag, map ~= nil))
+	end
+	if map then
+		table.insert(body, map)
+	end
+	-- The name sits in the top border: the rail's lead and trailing line carry
+	-- the border, so it breaks only around the text and its 4px pads.
+	return ui.el("div", { key = "tab:" .. tostring(tab), class = "agent-nav-tab", attrs = { ["data-tab"] = tostring(tab) } }, {
+		ui.el("div", { class = "agent-nav-tab-rail" }, {
+			ui.el("div", { class = "agent-nav-tab-lead" }),
+			ui.el("span", { class = "agent-nav-tab-name", attrs = { title = label }, text = label }),
+			ui.el("div", { class = "agent-nav-tab-line" }),
+		}),
+		ui.el("div", { class = "agent-nav-tab-body" }, body),
+	})
+end
+
+local function header_node(): Node
+	return ui.el("header", { class = "agent-nav-header" }, {
+		ui.el("span", { class = "agent-nav-heading", text = "Agents" }),
+		ui.el("button", {
+			key = "display:toggle",
+			actions = { click = "display:toggle" },
+			class = "agent-nav-action agent-nav-display",
+			attrs = {
+				title = "Display settings",
+				["aria-label"] = "Display settings",
+				["aria-expanded"] = tostring(displayMenu),
+			},
+		}, { ui.node("icon", { name = "more" }) }),
+	})
+end
+
 local function build_view(cx: WindowCx): Node
 	if next(sampledPanes) == nil then
 		sample_status(cx)
 	end
 
+	local grouped = group_tabs()
+	local mapped = grouped and show_map()
+
 	local tab_to_session: { [number]: number } = {}
+	local tabs_by_id: { [number]: TabInfo } = {}
+	local order_of_tab: { [number]: number? } = {}
 	for _, t in cx.session:tabs() do
 		tab_to_session[t.id] = t.session
+		tabs_by_id[t.id] = t
+	end
+	for _, s in cx.session:sessions() do
+		local position = 0
+		for _, id in s.tabs do
+			position += 1
+			order_of_tab[id] = position
+		end
 	end
 
-	local session_groups: { [number]: { name: string, agents: { AgentRow } } } = {}
+	local session_groups: { [number]: { name: string, rows: { AgentRow } } } = {}
 	local session_order: { number } = {}
 	for _, s in cx.session:sessions() do
-		session_groups[s.id] = { name = s.name, agents = {} }
+		session_groups[s.id] = { name = s.name, rows = {} }
 		table.insert(session_order, s.id)
 	end
 
 	for _, p in cx.session:panes() do
+		if p.focused == true and p.pane ~= slotPane then
+			mapSelectedPane = p.pane
+		end
 		local sid = p.tab and tab_to_session[p.tab]
 		local group = sid and session_groups[sid]
 		if group and sid and is_navigable_pane(p) then
@@ -2590,9 +2944,10 @@ local function build_view(cx: WindowCx): Node
 			local badge: Badge = if icon ~= ""
 				then { kind = "icon", name = icon }
 				else { kind = "letter", text = letter_of(title) }
-			table.insert(group.agents, {
+			table.insert(group.rows, {
 				pane = p.pane,
 				session = sid,
+				tab = p.tab,
 				title = title,
 				badge = badge,
 				status = status,
@@ -2602,36 +2957,73 @@ local function build_view(cx: WindowCx): Node
 	end
 
 	local menu_drawn = false
-	local sections = {}
+	local css: { string } = {}
+	local sections: { Node } = {}
 	for _, sid in session_order do
 		local g = session_groups[sid]
-		if #g.agents > 0 then
-			local rows = { session_header(sid, g.name) }
+		if #g.rows > 0 then
+			local rows: { Node } = { session_header(sid, g.name) }
 			if menu and menu.session == sid then
 				table.insert(rows, menu_node(menu))
 				menu_drawn = true
 			end
-			for _, ag in g.agents do
-				local action_key = goto_key(ag.session, ag.pane)
-				table.insert(rows, ui.el("button", {
-					key = action_key,
-					actions = { click = action_key },
-					class = "agent-nav-agent status-" .. ag.status .. (if ag.is_current then " is-current" else ""),
-					attrs = { title = ag.title .. " · " .. ag.status },
-				}, {
-					badge_node(ag.badge),
-					-- Running titles use Tern's native per-character shimmer (the sweep omp's
-					-- working label uses); its colors come from --sh-* in styles.css.
-					if ag.status == "running"
-						then ui.el("span", { class = "agent-nav-title" }, {
-							ui.node("shimmer", { mode = "classic", spans = { { t = ag.title } } }),
-						})
-						else ui.el("span", { class = "agent-nav-title", text = ag.title }),
-				}))
+			local buckets: { [number]: { AgentRow } } = {}
+			local tab_ids: { number } = {}
+			for _, ag in g.rows do
+				local tab = ag.tab
+				if tab then
+					local bucket = buckets[tab]
+					if not bucket then
+						bucket = {}
+						buckets[tab] = bucket
+						table.insert(tab_ids, tab)
+					end
+					table.insert(bucket, ag)
+				end
 			end
-			table.insert(sections, ui.el("section", { class = "agent-nav-group" }, rows))
+			table.sort(tab_ids, function(a: number, b: number): boolean
+				local oa, ob = order_of_tab[a] or math.huge, order_of_tab[b] or math.huge
+				return if oa ~= ob then oa < ob else a < b
+			end)
+			local content: { Node } = {}
+			local plain: { Node } = {}
+			for _, tab in tab_ids do
+				local bucket = buckets[tab]
+				-- Layout coordinates define reading order, independently of pane
+				-- creation order and whether the outline preference is enabled.
+				local cells = layout_cells(cx, tab)
+				sort_rows(bucket, cells)
+				if grouped and #bucket > 1 then
+					if #plain > 0 then
+						table.insert(content, ui.el("div", { class = "agent-nav-plain-rows" }, plain))
+						plain = {}
+					end
+					table.insert(content, tab_box(tab, bucket, tabs_by_id[tab], mapped, cells, css))
+				else
+					for _, ag in bucket do
+						table.insert(plain, agent_row_node(ag))
+					end
+				end
+			end
+			if #plain > 0 then
+				if grouped then
+					table.insert(content, ui.el("div", { class = "agent-nav-plain-rows" }, plain))
+				else
+					content = plain
+				end
+			end
+			if grouped then
+				table.insert(rows, ui.el("div", { class = "agent-nav-tabs" }, content))
+			else
+				for _, row in content do
+					table.insert(rows, row)
+				end
+			end
+			table.insert(sections, ui.el("section", { key = "session:" .. tostring(sid), class = "agent-nav-group" }, rows))
 		end
 	end
+
+	install_map_css(if mapped then table.concat(css, "\n") else "")
 
 	if menu and not menu_drawn then
 		menu = nil
@@ -2641,15 +3033,26 @@ local function build_view(cx: WindowCx): Node
 		table.insert(sections, ui.el("div", { class = "agent-nav-empty", text = "No agent sessions active" }))
 	end
 
-	local children = {
-		ui.el("header", { class = "agent-nav-header" }, {
-			ui.el("span", { class = "agent-nav-heading", text = "Agents" }),
-		}),
+	local children: { Node } = {
+		header_node(),
 		ui.el("div", { class = "agent-nav-groups" }, sections),
 	}
-	if menu then
-		local key = "dismiss:" .. tostring(menu.session)
-		table.insert(children, ui.el("button", { key = key, actions = { click = key }, class = "agent-nav-dismiss", attrs = { ["aria-label"] = "Close harness menu" } }))
+	if displayMenu then
+		table.insert(children, display_menu_node())
+	end
+	local dismiss_key: string? = nil
+	if displayMenu then
+		dismiss_key = "display:dismiss"
+	elseif menu then
+		dismiss_key = "dismiss:" .. tostring(menu.session)
+	end
+	if dismiss_key then
+		table.insert(children, ui.el("button", {
+			key = dismiss_key,
+			actions = { click = dismiss_key },
+			class = "agent-nav-dismiss",
+			attrs = { ["aria-label"] = "Close menu" },
+		}))
 	end
 	return ui.el("div", { class = "agent-nav-root" }, children)
 end
@@ -2808,6 +3211,7 @@ tern.command({
 			setWantPanel(false)
 			slotPane, rendered, renderedPane = nil, nil, nil
 			menu = nil
+			displayMenu = false
 			lastRailTab = nil
 			-- A job that still owns parked panes keeps them: closing the rail is
 			-- not a reason to abandon their tab, and the feature stays off.
@@ -2864,8 +3268,9 @@ tern.on("canvas_action", function(ev: CanvasAction, cx: WindowCx): boolean?
 end)
 
 tern.on("focus", function(ev: FocusEvent, cx: WindowCx)
-	if menu and ev.pane ~= slotPane then
+	if (menu or displayMenu) and ev.pane ~= slotPane then
 		menu = nil
+		displayMenu = false
 	end
 	followAndDraw(cx, ev.tab)
 end)
