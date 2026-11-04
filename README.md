@@ -1,8 +1,10 @@
 # Tern Agent Navigations
 
-A compact navigator panel for [Tern](https://stencil.so/tern) showing agents grouped by **Tern Session → Agent Session**. Each agent is represented by a single row featuring its harness logo and session title, clickable to focus.
+A compact navigator panel for [Tern](https://stencil.so/tern) showing agents grouped by **Tern Session → Tab → Agent Session**. Each agent is represented by a single row featuring its harness logo and session title, clickable to focus.
 
 ![Agent Navigations panel](docs/screenshot.png)
+
+Example workspace with tab outlines, compact single-agent rows, and a live layout map matching the four native blocks.
 
 ## Usage
 
@@ -11,11 +13,16 @@ A compact navigator panel for [Tern](https://stencil.so/tern) showing agents gro
 - Command palette `Agent Nav: Reset Width`: Reset panel width to the default ratio (20% of the active tab width).
 - Click any agent row: Immediately switches to that agent's Tern session and focuses its pane.
 - Each session header has **+** to start omp and **…** to choose a harness. The menu's **Open in new tab** switch selects a new tab or a right split in that session's current tab.
+- **…** in the **Agents** header opens display settings: **Group rows by tab** and **Show layout map**. Both default on. Turning grouping off restores the flat session list and hides maps without changing the map preference.
 
 ## Behavior & Design
 
 - **Single panel per window, follows active tab**: The window keeps one canvas and moves it to the active tab as a full-height rail. Content pane IDs and the split hierarchy are retained. Saved divider ratios are fitted through Tern's fractional-cell resize operations.
 - **Proportional fixed width**: Dragging the divider updates the remembered share ratio (`agent_nav.share`), which travels across tabs and scales smoothly with window resizing. Intermediate widths produced while rebuilding a multi-block tab are never saved as manual divider adjustments.
+- **Session order**: rows follow native tab order, then block position within each tab, from left to right across each row and top to bottom. Moving a tab or block updates this order in both grouped and flat display modes.
+- **Tab outlines**: tabs appear in native tab order. A single agent is an ordinary row, with no tab label, outline, or map. Consecutive ordinary rows keep their compact spacing; the larger gap appears only between outlined groups or between a group and ordinary rows. Tabs with at least two agent rows have an unfilled outline with all four corners rounded and 2px of additional top/bottom inner padding. Their subdued tab name sits in a tight break in the top border, aligned with the rows' logo column. Named tabs use their name; unnamed tabs use their focused content title. Long labels truncate with a full-title tooltip.
+- **Ghost layout map**: tabs with at least two agent rows have one 48×32 map floating at the right without reserving row space. It appears only while the tab group is hovered, with no backing surface, border, or cell rings. The map uses the lower corner when the selected block is among the first 50% of that group's ordered agent rows, otherwise the upper corner. A group without the selected block uses the upper corner; an odd middle row belongs to the latter half. A single agent row never shows a map, even when its tab also contains ordinary terminals. Soft cells follow content split directions and ratios, excluding the navigator itself; ordinary content remains muted. Hovering a row highlights its exact pane rectangle, including while the row is pressed and after it is clicked. Only cell colors transition; corner changes are instant, and rows never scale on press. Floats appear as small overlays at their owner's corner; zoom retains the underlying split layout. Maps are informational and have no click action.
+  While the rail owns native focus, placement retains the last selected content block so pressing a row does not temporarily flip the map's corner.
 - **Titles and harness**: each row shows the agent's pane title (omp, Codex and Copilot write their session title there). A row's harness comes from the command the block was opened with, then the pane's foreground program and command line, then its title. Names match only as whole words (`claude-code`, `codex-acp` stay whole), so `components/` or `prompt` is never read as omp. Tern reports every command block as an agent block, so a launched command that names no harness and has not reported a turn (`working`, `waiting_input`) since the plugin loaded is not listed at all — a `pnpm run` block stays out of the rail; once a block does report a turn, it keeps its row with a first-character avatar instead of another harness's logo.
 - **Harness menu**: OMP comes first, followed by Tern's built-in Claude Code, Codex, and GitHub Copilot registrations and your `agents.custom` entries. Known names use their harness icon. Other names use a first-character avatar. The menu opens over the rows without moving them.
 - **Enable Tern UI**: controls how agents launched by the menu and `+` run. When enabled, omp uses Tern's native frontend and other agents open through `tern acp`. Local launches retain the window's Tern configuration and daemon context. When disabled, omp and the built-in CLIs use their terminal interfaces. Tern's custom ACP configuration does not provide a native TUI command, so custom entries are unavailable while this switch is off. The preference defaults to enabled and persists across reloads.
@@ -25,11 +32,7 @@ A compact navigator panel for [Tern](https://stencil.so/tern) showing agents gro
 - **Hook budget**: Screen reads are cached per pane and staggered, with at most two fresh reads per render. Layout restoration runs in bounded batches across ticks. Tern pauses a hook that exceeds its 50 ms Lua budget and retries it with increasing backoff; repeated overruns can leave the panel stale during that pause.
 - **Safe lifecycle**: Explicitly closing the panel disables the feature; if the containing tab or session is closed, the panel automatically restores in the remaining active tab.
 - **Reload recovery**: An unfinished rearrangement resumes after plugin reload in the same window. The controller records responsibility before parking a content pane and keeps that responsibility until the pane has returned. Recovery across the loss or replacement of a native window is limited by Tern's window lifecycle APIs.
-- Persisted configuration keys: `agent_nav.enabled`, `agent_nav.side`, `agent_nav.share`, `agent_nav.launch_ui`, `agent_nav.open_in_tab`.
-
-Focused agent row, with a fixed neutral background:
-
-![Focused agent row](docs/screenshot-focused.png)
+- Persisted configuration keys: `agent_nav.enabled`, `agent_nav.side`, `agent_nav.share`, `agent_nav.launch_ui`, `agent_nav.open_in_tab`, `agent_nav.group_tabs`, `agent_nav.minimap`.
 
 ## Known Limitations
 
@@ -42,13 +45,15 @@ Focused agent row, with a fixed neutral background:
 ## Development
 
 - `tests/smoke.py`: blackbox regression against a running Tern window. Fixture agents run a generated local wire client that completes the TSP composer handshake, emits progress and screen output, and exits with a chosen status. It never invokes a model. Run the state and native-close subset with `python3 tests/smoke.py --existing-window --only test_native_tsp_five_state_fixture,test_manual_close_disables --artifacts /tmp/tern-nav-native-fixture`.
+  For the tab-group/map feature in an isolated window, pass its control endpoint explicitly: `python3 tests/smoke.py --existing-window --control /tmp/nav-verify.sock --only test_tab_groups_and_minimap --artifacts /tmp/tern-nav-tab-groups`. Set `TERN_CONFIG_DIR` and `TERN_DAEMON_SOCKET` to that sandbox; test state and restoration then stay within it.
+
 - `tests/width_regression.py`: native regression for four- and eight-block tab switches, both rail sides, content ratios, focus changes during restoration, default width memory and manual divider adjustments. Run in an isolated visible GUI sandbox with `python3 tests/width_regression.py --control /tmp/navw.sock --config /tmp/navw/config --daemon /tmp/navw/daemon.sock` after installing the plugin there. Cell comparisons require rendered terminal dimensions; the initial 80x24 grid is not evidence of rendering.
   Give the eight-block fixture enough space for native minimum pane sizes; a 1780×940 viewport was exercised. Keep the half-cell accuracy threshold unchanged.
 - `.agents/skills/verify-tern-agent-nav/`: live verification harness and the feature map under `features/`.
 
 ## Installation
 
-Requires Tern 0.9.8 or newer.
+Requires Tern 0.9.11 or newer.
 
 ```sh
 tern plugin install /path/to/tern-agent-nav --force

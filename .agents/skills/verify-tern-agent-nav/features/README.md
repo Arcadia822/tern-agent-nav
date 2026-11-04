@@ -16,6 +16,7 @@ drives; line numbers cited are from that working tree.
 | 07 | [copilot-ask-user.md](07-copilot-ask-user.md) | copilot ask-user 识别为等待人类（紫色），且优先于 running |
 | 08 | [notifications-english.md](08-notifications-english.md) | 插件通知文案全英文 |
 | 09 | [session-harness-actions.md](09-session-harness-actions.md) | + / … 按钮、紧凑全局 dropdown、不透明背景、关闭交互、UI 模式、Open in new tab（tab/block 落点）、Harness 图标与字母 Avatar |
+| 10 | [tab-groups-minimap.md](10-tab-groups-minimap.md) | Tab 与 block 空间排序、分组关闭后保持顺序、普通行紧凑间距与分组边界大间距、标题与 Logo 左对齐、断口紧贴文字、单 session 隐藏、选中行前后半区决定地图上下角、hover/按下/点击后准确映射且行不缩放、仅颜色动效、两个开关持久化 |
 
 ## Harness
 

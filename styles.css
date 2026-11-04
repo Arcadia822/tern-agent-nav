@@ -5,6 +5,7 @@
     --agent-nav-running-shine: light-dark(#422006, #ffe08a);
     --agent-nav-unread: light-dark(#15803d, #3ecf8e);
     --agent-nav-error: light-dark(#c1121f, #ff6166);
+    --agent-nav-map-lit: color-mix(in srgb, var(--t1) 26%, transparent);
     position: relative;
     display: flex;
     flex-direction: column;
@@ -38,6 +39,121 @@
 .agent-nav-groups { display: flex; flex-direction: column; gap: 16px; padding: 8px 0 12px; }
 .agent-nav-group { position: relative; display: flex; flex-direction: column; min-width: 0; }
 
+/* Tab groups: one outline box per tab. The tab name sits in the top border,
+   legend style: the rail's lead and trailing line draw that border, the name
+   breaks it, and the name's text starts exactly where the row logos do
+   (1px box border + 12px row padding). The 7px lead above the border holds the
+   name's upper half, so nothing overlaps the rows below. */
+.agent-nav-tabs { display: flex; flex-direction: column; gap: 14px; }
+.agent-nav-plain-rows { display: flex; flex-direction: column; min-width: 0; }
+.agent-nav-tab { padding-top: 7px; min-width: 0; }
+.agent-nav-tab-rail { display: flex; align-items: flex-start; height: 7px; }
+.agent-nav-tab-lead,
+.agent-nav-tab-line {
+    flex: none;
+    height: 5px;
+    border-top: 1px solid var(--l3);
+}
+.agent-nav-tab-lead { width: 9px; border-left: 1px solid var(--l3); border-top-left-radius: 5px; }
+.agent-nav-tab-line { flex: 1 1 auto; min-width: 6px; border-right: 1px solid var(--l3); border-top-right-radius: 5px; }
+.agent-nav-tab-name {
+    flex: 0 1 auto;
+    min-width: 0;
+    max-width: 100%;
+    height: 14px;
+    margin: -7px 0 0;
+    padding: 0 4px;
+    overflow: hidden;
+    font-size: 11px;
+    font-weight: 500;
+    line-height: 14px;
+    color: var(--t3);
+    opacity: 0.65;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+}
+.agent-nav-tab-body {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    margin-top: -2px;
+    padding-top: 4px;
+    padding-bottom: 2px;
+    border: 1px solid var(--l3);
+    border-top: 0;
+    border-radius: 0 0 5px 5px;
+}
+
+/* A ghost layout map floats over the upper-right corner without reserving
+   row space. It appears only while its tab group is hovered; cells have no
+   backing surface, border, or ring. */
+.agent-nav-tabs,
+.agent-nav-tab,
+.agent-nav-tab-body,
+.agent-nav-map { transition: none; animation: none; transform: none; }
+.agent-nav-cell,
+.agent-nav-map-indicator {
+    transition: background-color 120ms ease-out;
+    animation: none;
+    transform: none;
+}
+.agent-nav-map {
+    position: absolute;
+    top: 4px;
+    right: 8px;
+    width: 48px;
+    height: 32px;
+    margin: 0;
+    border-radius: 4px;
+    --agent-nav-map-cell: color-mix(in srgb, var(--t1) 8%, transparent);
+    --agent-nav-map-muted: color-mix(in srgb, var(--t1) 4%, transparent);
+    background: transparent;
+    border: 0;
+    box-shadow: none;
+    opacity: 0;
+    z-index: 1;
+    overflow: hidden;
+    pointer-events: none;
+}
+.agent-nav-map.is-bottom { top: auto; bottom: 4px; }
+.agent-nav-tab:hover .agent-nav-map { opacity: 1; }
+.agent-nav-cell {
+    position: absolute;
+    border-radius: 2px;
+    background: var(--agent-nav-map-cell);
+}
+.agent-nav-cell.is-muted { background: var(--agent-nav-map-muted); }
+.agent-nav-cell.is-float {
+    background: color-mix(in srgb, var(--t1) 14%, transparent);
+}
+/* A pressed native button scales by default, creating a containing block for
+   its absolute indicator. Rows must never transform, including while pressed. */
+.agent-nav-root .agent-nav-agent,
+.agent-nav-root .agent-nav-agent:active { transform: none; animation: none; transition: none; }
+.agent-nav-tab-body .agent-nav-agent,
+.agent-nav-tab-body .agent-nav-agent:active { position: static; overflow: visible; }
+.agent-nav-map-indicator {
+    position: absolute;
+    z-index: 2;
+    border-radius: 2px;
+    background: transparent;
+    border: 0;
+    box-shadow: none;
+    opacity: 0;
+    pointer-events: none;
+}
+.agent-nav-agent:hover .agent-nav-map-indicator { opacity: 1; background: var(--agent-nav-map-lit); }
+
+
+/* Display settings live in the header, away from the per-session harness menu. */
+.agent-nav-header .agent-nav-display { margin-left: auto; }
+.agent-nav-menu.agent-nav-display-menu { top: 34px; }
+.agent-nav-mode-label { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.agent-nav-mode.has-note { align-items: flex-start; white-space: normal; }
+.agent-nav-mode-note { font-size: 11px; line-height: 1.3; color: var(--t3); }
+.agent-nav-mode-switch.is-disabled { opacity: 0.45; cursor: default; }
+
 /* Tern session name: as written, fainter than any agent title. */
 .agent-nav-session {
     padding: 4px 12px;
@@ -65,6 +181,7 @@
     border-radius: 0;
     background: transparent;
     box-shadow: none;
+    transition: none;
     text-align: left;
     font: 400 13px/1.4 var(--sans);
     color: var(--t2);
