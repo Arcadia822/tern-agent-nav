@@ -10,6 +10,9 @@
 
 In `sample_status`, focusing a pane clears its unread flag; a running-to-finished transition while
 unfocused or a bell alert sets it. A nonzero exit takes precedence over unread.
+Native `agent_state` events repaint the selected row without a focus or title change. The
+polling tick remains a fallback for terminal-only hints; it must not be the only notification
+path for native agents.
 
 ## How to get to it (user POV)
 
@@ -49,13 +52,21 @@ actually exiting with a nonzero status.
 
 ```sh
 python3 tests/smoke.py --existing-window \
-  --only test_native_tsp_five_state_fixture,test_manual_close_disables \
+  --only test_selected_status_updates_without_interaction,test_native_tsp_five_state_fixture,test_manual_close_disables \
   --artifacts /tmp/tern-nav-native-fixture
 ```
 
 The serial subset runs in one setup/teardown. `wire-clients.json` and the per-client wire event
 files record starts, retained prompt delivery, render acknowledgements and shutdown. Frames
 obey Tern's credit window; raw progress bytes do not provide a render acknowledgement.
+
+`test_selected_status_updates_without_interaction` keeps one pane selected while its real
+progress changes from running to attention, idle/read, and running again. A passive fixture
+listener records the public `agent_state` event to a file; the test awaits a new event for each
+transition before inspecting the row. A child's stdout ACK alone does not prove Tern processed
+the bytes. It sends no focus, pointer or repeated UI polling commands while awaiting the event,
+which could otherwise wake a deferred timer and hide a stale row. Each state must update its
+class and text color.
 
 ## Gotchas
 

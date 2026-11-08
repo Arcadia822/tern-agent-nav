@@ -23,6 +23,8 @@
   except for a native agent block that has reported a turn (`working` / `waiting_input`,
   latched in `everActive` line 1779). Tern reports every command block as `kind: agent`,
   so without that gate a launched `pnpm run` becomes an "agent session".
+  Turn evidence lasts until the native pane closes; a later list snapshot must not erase it.
+  It is not persisted across plugin reloads.
 
 ## How to get to it (user POV)
 
@@ -41,11 +43,14 @@ $W 'tree .agent-nav-logo'    # geometry if the window exposes the canvas DOM (em
 
 - Provider marks have an intrinsic 24px box — without the svg override they blow rows to 24px.
   Regression check: open a Codex row next to an omp row; marks must be the same visual size.
-- `detect_harness` needs the foreground command for panes started before the window opened; it
-  probes via `tern process <pane> --json` asynchronously (`probeForeground`, lines 1827–1852), so a
-  freshly-focused plain terminal may be absent from the rail until the probe answers. Native
-  agent blocks are identified from `cx.agents:list()` in the same tick, so their logo does not
-  wait for a probe or a session title.
+- `detect_harness` needs the foreground command for panes started before installation or before
+  the window opened. Both terminal panes and unidentified idle agent blocks fall back to
+  `tern process <pane> --json` asynchronously. A cached result queues the rail's lifecycle update
+  in a fresh window turn so a late result cannot redraw a canvas that is closing. No new agent
+  turn or focus change is required. Known launch commands still identify in the same tick.
+- `test_cold_start_wrapped_agent` runs an idle no-model agent behind an anonymous launcher,
+  reloads the plugin with the panel closed, and opens it again. Only the real foreground argv
+  names the harness; the original process must reappear without another turn.
 - iOS runtime skips the probe (`tern.runtime.os == "ios"`, line 1830) — icons fall back to
   program/title matching there.
 - Regression to guard (2026-11-02 fix): a terminal pane running `pnpm run …` under a path

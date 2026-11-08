@@ -60,6 +60,7 @@ import plistlib
 from pathlib import Path
 import re
 import shutil
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -425,6 +426,17 @@ local agent_spec = {agent_lit}
 local created_fixture_panes = {{}}
 local known_agents = {{}}
 local last_created_pane = nil
+local observed_agent_states = {{}}
+tern.on("agent_state", function(ev)
+    if not known_agents[ev.pane] then return end
+    local key = tostring(ev.pane)
+    local prior = observed_agent_states[key]
+    observed_agent_states[key] = {{
+        state = ev.new,
+        sequence = if prior then prior.sequence + 1 else 1,
+    }}
+    tern.fs.write(tmp_cwd .. "/agent-states.json", tern.json.encode(observed_agent_states))
+end)
 
 local function write_ack(payload)
     if ack_path then
@@ -3017,6 +3029,47 @@ class SmokeRunner:
         assert self.get_nav_pane_id() == nav_pane_before, "Reload failed to adopt existing canvas pane ID"
         self.wait_visible_ratio(self.baseline_ratio, "Reload failed to maintain navigator ratio")
 
+    def test_cold_start_wrapped_agent(self):
+        """An idle agent behind an opaque launcher is discovered from its real foreground argv."""
+        assert self.base is not None and self.client_path is not None
+        # The launch command and TSP app are deliberately anonymous; only the running
+        # program's argv names Codex. No model or real agent executable is involved.
+        client = self.base / "codex"
+        client.write_text(build_no_model_client())
+        client.chmod(0o755)
+        original_client = self.client_path.read_text()
+        self.client_path.write_text(f"#!/bin/sh\nexec {shlex.quote(str(client))}\n")
+        try:
+            pane = self.create_agent("Cold Start Fixture", how="split")
+        finally:
+            self.client_path.write_text(original_client)
+
+        self.emit_wire(pane, progress(0))
+        selector = f".agent-nav-row-{pane}.status-done-read"
+        self.wait_until(lambda: self.visible(selector), "Fixture did not finish before plugin reload")
+        foreground = json.loads(subprocess.check_output(
+            [str(self.tern_bin), "process", str(pane), "--json"], text=True, timeout=10,
+        ))
+        assert str(client) in foreground["foreground"]["argv"], foreground
+
+        self.ctl("plugins", "run", "plugin.agent-nav.toggle")
+        self.wait_until(lambda: not self.visible(".agent-nav-root"), "Panel did not close before reload")
+        subprocess.run(
+            [str(self.tern_bin), "plugin", "reload", "agent-nav"],
+            check=True, capture_output=True,
+        )
+        self.ctl("wait", "300")
+        self.ctl("plugins", "run", "plugin.agent-nav.toggle")
+        self.wait_until(
+            lambda: self.visible(selector),
+            "Pre-existing idle agent was not rediscovered after plugin reload",
+            timeout=10,
+        )
+        state = self.inspect_sdk_state()
+        assert any(p["pane"] == pane and p.get("exited") is None for p in state["panes"]), (
+            "Discovery must retain the original running process"
+        )
+
     def test_event_storms_reconciliation(self):
         for _ in range(3):
             self.ctl("tab", "next")
@@ -3028,6 +3081,41 @@ class SmokeRunner:
         self.ctl("wait", "200")
         assert self.is_singleton(), "Event storm left invalid canvas state"
         self.wait_visible_ratio(self.baseline_ratio, "Event storm corrupted navigator ratio")
+
+    def test_selected_status_updates_without_interaction(self):
+        """Real progress events repaint a selected row without focus or pointer changes."""
+        pane = self.create_agent("Selected State Fixture", how="split")
+        selector = f".agent-nav-row-{pane}"
+        self.wait_until(lambda: self.visible(selector + ".status-running.is-current"), "Fixture not selected")
+        previous_color = self.dump(selector + " .agent-nav-title")[0]["color"]
+        assert self.base is not None
+        states_path = self.base / "agent-states.json"
+
+        def native_state():
+            try:
+                return json.loads(states_path.read_text()).get(str(pane), {})
+            except (OSError, json.JSONDecodeError):
+                return {}
+
+        for kind, native, status in ((4, "waiting_input", "attention"), (0, "idle", "done-read"), (1, "working", "running")):
+            before = native_state().get("sequence", 0)
+            self.emit_wire(pane, progress(kind))
+            # Child stdout ACKs do not prove Tern has processed the progress bytes.
+            # Observe the public native event via files, without pumping ctl commands.
+            self.wait_until(
+                lambda: (observed := native_state()).get("sequence", 0) > before and observed.get("state") == native,
+                f"Native agent_state did not deliver {native} for pane {pane}",
+                timeout=10,
+            )
+            rows = self.visible(selector)
+            assert len(rows) == 1, f"Selected fixture disappeared: {rows}"
+            classes = rows[0]["class"].split()
+            assert "is-current" in classes and f"status-{status}" in classes, (
+                f"Selected pane did not repaint {status} without interaction: {classes}"
+            )
+            color = self.dump(selector + " .agent-nav-title")[0]["color"]
+            assert color != previous_color, f"Text color stayed {color} after transition to {status}"
+            previous_color = color
 
     def test_native_tsp_five_state_fixture(self):
         """Every row state from real pane signals: composer handshake, progress OSC 9;4, exit status.
@@ -3413,6 +3501,8 @@ class SmokeRunner:
         self.test_parent_tab_close_recreates()
         self.test_parent_session_close_recreates()
         self.test_plugin_reload_adoption()
+        self.test_cold_start_wrapped_agent()
+        self.test_selected_status_updates_without_interaction()
         self.test_event_storms_reconciliation()
         self.test_native_tsp_five_state_fixture()
         self.test_native_tsp_latency_batch_fixture()

@@ -1,7 +1,7 @@
 schema = 1
 id = "agent-nav"
 name = "Agent Navigations"
-version = "0.3.0"
+version = "0.3.1"
 description = "Agent block navigator across sessions"
 icon = "compass"
 window = "window.luau"

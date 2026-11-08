@@ -1842,12 +1842,15 @@ end
 -- View
 --------------------------------------------------------------------------------
 
--- A pane's foreground program, from `tern process`, for terminal panes whose
--- window metadata no longer carries the command (programs started before this
--- window opened). One lookup per pane and title: every CLI call is a daemon
--- connection, so they are cached rather than repeated on each render.
+local followAndDraw: (WindowCx?, number?) -> ()
+
+-- A pane's foreground program, from `tern process`, when window metadata no
+-- longer identifies the harness (including programs started before installation).
+-- One lookup per pane and title: every CLI call is a daemon connection, so they
+-- are cached rather than repeated on each render.
 local foreground: { [number]: { title: string, argv: string } } = {}
 local probing: { [number]: boolean } = {}
+local probeRefreshPending = false
 
 local function probeForeground(pane_info: any)
 	local pane, title = pane_info.pane, pane_info.title or ""
@@ -1867,8 +1870,15 @@ local function probeForeground(pane_info: any)
 					argv = string.lower(table.concat(fg.argv, " "))
 				end
 			end
-			-- The next tick draws the row.
 			foreground[pane] = { title = title, argv = argv }
+			if argv ~= "" and not probeRefreshPending then
+				probeRefreshPending = true
+				-- Reconcile queued close/focus events before touching a canvas again.
+				tern.timer(0, function(cx)
+					probeRefreshPending = false
+					followAndDraw(cx)
+				end)
+			end
 		end)
 	end)
 	if not ok then
@@ -2516,6 +2526,9 @@ local function is_navigable_pane(pane_info: any): boolean
 		-- forever. Keep the row when its harness is named, or when its program
 		-- reported a turn (latched in everActive).
 		local harness, _ = detect_harness(pane_info)
+		if harness == "agent" and not everActive[pane_info.pane] then
+			probeForeground(pane_info)
+		end
 		return harness ~= "agent" or everActive[pane_info.pane] == true
 	end
 	if pane_info.kind == "terminal" then
@@ -2547,16 +2560,13 @@ local function sample_status(cx: WindowCx)
 			end
 		end
 		agentInfo = fresh
-		-- Keep the panes that have reported a turn. Tern offers no field that says
-		-- "this block runs an agent", so a first turn is the proof a bare command
-		-- block never gives.
-		local active: { [number]: boolean } = {}
+		-- Keep turn evidence until pane_closed, even when a later list omits the
+		-- pane. A snapshot is not the lifetime of an already identified agent.
 		for pane, info in fresh do
-			if everActive[pane] or info.state == "working" or info.state == "waiting_input" then
-				active[pane] = true
+			if info.state == "working" or info.state == "waiting_input" then
+				everActive[pane] = true
 			end
 		end
-		everActive = active
 	end
 
 	local freshSampled: { [number]: SampledPane } = {}
@@ -3179,7 +3189,7 @@ local function follow(cx: WindowCx, tab: number?)
 	end
 end
 
-local function followAndDraw(cx: WindowCx?, tab: number?)
+followAndDraw = function(cx: WindowCx?, tab: number?)
 	if not cx then
 		return
 	end
@@ -3279,6 +3289,7 @@ end)
 -- job still owes; the job itself stays until nothing is parked.
 tern.on("pane_closed", function(ev: PaneEvent, cx: WindowCx)
 	wasRunning[ev.pane] = nil
+	everActive[ev.pane] = nil
 	unreadPanes[ev.pane] = nil
 	sampledPanes[ev.pane] = nil
 	layout_forget(cx, ev.pane, slot(cx))
@@ -3298,7 +3309,12 @@ tern.on("session_ended", function(_ev: SessionEndedEvent, cx: WindowCx)
 	followAndDraw(cx)
 end)
 
--- Re-render immediately on window events, pane title changes, and agent turn completions.
+-- State changes only repaint; they do not move or resize the rail.
+tern.on("agent_state", function(_ev: AgentStateEvent, cx: WindowCx)
+	draw(cx)
+end)
+
+-- Other window events can also change the rail's placement.
 for _, name in { "tab_created", "pane_created", "title", "agent_finished" } do
 	tern.on(name, function(_ev: any, cx: WindowCx)
 		followAndDraw(cx)
@@ -3317,7 +3333,8 @@ tern.on("window_start", function(cx: WindowCx)
 end)
 
 local function tick(cx: WindowCx?)
-	followAndDraw(cx)
+	-- Renew first so a failed sampling hook cannot discard the next refresh.
 	tern.timer(TICK_MS, tick)
+	followAndDraw(cx)
 end
 tern.timer(TICK_MS, tick)
