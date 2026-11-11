@@ -255,7 +255,8 @@
 }
 .agent-nav-session-row .agent-nav-session { flex: 1 1 auto; min-width: 0; }
 
-.agent-nav-action {
+.agent-nav-action,
+.agent-nav-indicator {
     display: grid;
     place-items: center;
     flex: none;
@@ -267,13 +268,14 @@
     background: transparent;
     box-shadow: none;
     color: var(--t3);
-    cursor: pointer;
 }
+.agent-nav-action { cursor: pointer; }
 .agent-nav-action:hover,
 .agent-nav-action:focus-visible { background: var(--l1); color: var(--t1); }
 .agent-nav-action:focus-visible { outline: 1px solid var(--l4); outline-offset: -1px; }
 /* Tern's glyphs draw at 14px; shrink them to fit the 18px button. */
-.agent-nav-action .sf-icon { width: 13px; height: 13px; }
+.agent-nav-action .sf-icon,
+.agent-nav-indicator .sf-icon { width: 13px; height: 13px; }
 
 /* Floating under the session header: absolutely positioned, so opening it never
    pushes the rows it covers out of place. */
