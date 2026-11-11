@@ -2416,7 +2416,9 @@ local function session_header(session: number, name: string, firstmate: boolean)
 		table.insert(children, ui.el("span", {
 			class = "agent-nav-indicator",
 			attrs = { title = "First mate", ["aria-label"] = "First mate", role = "img" },
-		}, { ui.node("icon", { name = "md-ship_wheel" }) }))
+			-- Ship-wheel glyph from Tern's bundled Nerd Font; not a named surface icon.
+			text = utf8.char(0xF0833),
+		}))
 	end
 	table.insert(children, icon_button(new_key(session), "plus", if open_in_tab() then "New agent tab" else "New agent block"))
 	table.insert(children, icon_button(menu_key(session), "more", "Choose a harness"))
