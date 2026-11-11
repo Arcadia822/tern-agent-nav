@@ -13,6 +13,7 @@ Example workspace with tab outlines, compact single-agent rows, and a live layou
 - Command palette `Agent Nav: Reset Width`: Reset panel width to the default ratio (20% of the active tab width).
 - Click any agent row: Immediately switches to that agent's Tern session and focuses its pane.
 - Each session header has **+** to start omp and **…** to choose a harness. The menu's **Open in new tab** switch selects a new tab or a right split in that session's current tab.
+- A ship-wheel icon appears immediately left of **+** when the first content block in a session's first tab has a working directory named exactly `first mate` or `firstmate`. The indicator has a **First mate** tooltip.
 - **…** in the **Agents** header opens display settings: **Group rows by tab** and **Show layout map**. Both default on. Turning grouping off restores the flat session list and hides maps without changing the map preference.
 
 ## Behavior & Design
