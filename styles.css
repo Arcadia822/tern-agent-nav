@@ -276,6 +276,8 @@
 /* Tern's glyphs draw at 14px; shrink them to fit the 18px button. */
 .agent-nav-action .sf-icon,
 .agent-nav-indicator .sf-icon { width: 13px; height: 13px; }
+/* SVG marks sit below the text and font-glyph optical center. */
+.agent-nav-session-row .agent-nav-action .sf-icon { transform: translateY(-1px); }
 
 /* Floating under the session header: absolutely positioned, so opening it never
    pushes the rows it covers out of place. */
