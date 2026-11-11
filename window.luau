@@ -2410,12 +2410,17 @@ local function icon_button(key: string, icon: string, title: string): Node
 end
 
 
-local function session_header(session: number, name: string): Node
-	return ui.el("div", { class = "agent-nav-session-row" }, {
-		ui.el("div", { class = "agent-nav-session", text = name }),
-		icon_button(new_key(session), "plus", if open_in_tab() then "New agent tab" else "New agent block"),
-		icon_button(menu_key(session), "more", "Choose a harness"),
-	})
+local function session_header(session: number, name: string, firstmate: boolean): Node
+	local children: { Node } = { ui.el("div", { class = "agent-nav-session", text = name }) }
+	if firstmate then
+		table.insert(children, ui.el("span", {
+			class = "agent-nav-indicator",
+			attrs = { title = "First mate", ["aria-label"] = "First mate", role = "img" },
+		}, { ui.node("icon", { name = "md-ship_wheel" }) }))
+	end
+	table.insert(children, icon_button(new_key(session), "plus", if open_in_tab() then "New agent tab" else "New agent block"))
+	table.insert(children, icon_button(menu_key(session), "more", "Choose a harness"))
+	return ui.el("div", { class = "agent-nav-session-row" }, children)
 end
 
 -- A labeled switch row. A disabled switch keeps its place and states why it
@@ -2765,25 +2770,49 @@ local function layout_cells(cx: WindowCx, tab: number): { MapCell }?
 	return cells
 end
 
-local function sort_rows(rows: { AgentRow }, cells: { MapCell }?)
-	if #rows < 2 then
-		return
-	end
+local function pane_order(cells: { MapCell }?): (number, number) -> boolean
 	local positions: { [number]: MapCell } = {}
 	if cells then
 		for _, cell in cells do
 			positions[cell.pane] = cell
 		end
 	end
-	table.sort(rows, function(a: AgentRow, b: AgentRow): boolean
-		local pa, pb = positions[a.pane], positions[b.pane]
+	return function(a: number, b: number): boolean
+		local pa, pb = positions[a], positions[b]
 		local ay, by = if pa then pa.y else math.huge, if pb then pb.y else math.huge
 		if ay ~= by then
 			return ay < by
 		end
 		local ax, bx = if pa then pa.x else math.huge, if pb then pb.x else math.huge
-		return if ax ~= bx then ax < bx else a.pane < b.pane
+		return if ax ~= bx then ax < bx else a < b
+	end
+end
+
+local function sort_rows(rows: { AgentRow }, cells: { MapCell }?)
+	if #rows < 2 then
+		return
+	end
+	local before = pane_order(cells)
+	table.sort(rows, function(a: AgentRow, b: AgentRow): boolean
+		return before(a.pane, b.pane)
 	end)
+end
+
+-- Inspect the first content block, including blocks without an agent row.
+-- Tab cwd follows focus, so it cannot identify the first block's directory.
+local function firstmate_session(cx: WindowCx, tab: number?, panes: { PaneInfo }): boolean
+	if not tab then
+		return false
+	end
+	local before = pane_order(layout_cells(cx, tab))
+	local first: PaneInfo? = nil
+	for _, pane in panes do
+		if pane.tab == tab and pane.pane ~= slotPane and (not first or before(pane.pane, first.pane)) then
+			first = pane
+		end
+	end
+	local name = if first and first.cwd then string.match(first.cwd, "([^/\\]+)[/\\]*$") else nil
+	return name == "firstmate" or name == "first mate"
 end
 
 local function map_node(tab: number, rows: { AgentRow }, cells: { MapCell }, css: { string }, bottom: boolean): Node
@@ -2900,14 +2929,15 @@ local function build_view(cx: WindowCx): Node
 		end
 	end
 
-	local session_groups: { [number]: { name: string, rows: { AgentRow } } } = {}
+	local panes = cx.session:panes()
+	local session_groups: { [number]: { name: string, first_tab: number?, rows: { AgentRow } } } = {}
 	local session_order: { number } = {}
 	for _, s in cx.session:sessions() do
-		session_groups[s.id] = { name = s.name, rows = {} }
+		session_groups[s.id] = { name = s.name, first_tab = s.tabs[1], rows = {} }
 		table.insert(session_order, s.id)
 	end
 
-	for _, p in cx.session:panes() do
+	for _, p in panes do
 		if p.focused == true and p.pane ~= slotPane then
 			mapSelectedPane = p.pane
 		end
@@ -2972,7 +3002,7 @@ local function build_view(cx: WindowCx): Node
 	for _, sid in session_order do
 		local g = session_groups[sid]
 		if #g.rows > 0 then
-			local rows: { Node } = { session_header(sid, g.name) }
+			local rows: { Node } = { session_header(sid, g.name, firstmate_session(cx, g.first_tab, panes)) }
 			if menu and menu.session == sid then
 				table.insert(rows, menu_node(menu))
 				menu_drawn = true
