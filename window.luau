@@ -58,6 +58,8 @@ local HARNESS_ICONS: { [string]: string } = {
 	kimi = "sparkle",
 	kilo = "sparkle",
 	carly = "sparkle",
+	antigravity = "provider-google-antigravity",
+	agy = "provider-google-antigravity",
 }
 
 -- Tern registers these ids before their ACP adapters are installed.
